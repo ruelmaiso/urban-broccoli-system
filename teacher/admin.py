@@ -232,6 +232,11 @@ class TeacherDeployServer:
         self.udp_send_sock: Optional[socket.socket] = None
         self.udp_send_lock = threading.Lock()
         self.broadcast_target_ids: set[str] = set()
+        # Serializes lifecycle transitions.  Target ownership is tagged so a Stop
+        # which began before a later Start cannot tear down that later session.
+        self.broadcast_lifecycle_gate = threading.Lock()
+        self.broadcast_session_id = 0
+        self.broadcast_target_session_ids: dict[str, int] = {}
         self.broadcast_thread: Optional[threading.Thread] = None
         self.broadcast_stop_event = threading.Event()
         self.broadcast_audio_thread: Optional[threading.Thread] = None
@@ -434,6 +439,31 @@ class TeacherDeployServer:
     def _log_event(self, event: str, **data: object) -> None:
         payload = {"ts": round(time.time(), 3), "event": event, **data}
         self.logger.info(json.dumps(payload, sort_keys=True))
+
+    def _broadcast_diag(self, event: str, **data: object) -> None:
+        """Emit correlated Broadcast diagnostics without changing its lifecycle."""
+        with self.lock:
+            worker = self.broadcast_thread
+            audio_worker = self.broadcast_audio_thread
+            state = {
+                "targets": sorted(self.broadcast_target_ids),
+                "broadcast_thread_id": id(worker) if worker else None,
+                "broadcast_thread_alive": bool(worker and worker.is_alive()),
+                "broadcast_stop_event": self.broadcast_stop_event.is_set(),
+                "broadcast_audio_thread_id": id(audio_worker) if audio_worker else None,
+                "broadcast_audio_thread_alive": bool(audio_worker and audio_worker.is_alive()),
+                "broadcast_audio_stop_event": self.broadcast_audio_stop_event.is_set(),
+            }
+        self._log_event(
+            "broadcast_diag",
+            diag_event=event,
+            mono_ts=round(time.monotonic(), 6),
+            side="TEACHER",
+            thread_name=threading.current_thread().name,
+            thread_ident=threading.get_ident(),
+            **state,
+            **data,
+        )
 
     def _run_guarded_loop(self, loop_name: str, target, restart_delay_s: float = 1.0) -> None:
         while True:
@@ -769,6 +799,7 @@ class TeacherDeployServer:
                                 broadcast_audio_sock_to_close = client.broadcast_audio_sock
                                 client.broadcast_audio_sock = None
                             self.broadcast_target_ids.discard(pc_id)
+                            self.broadcast_target_session_ids.pop(pc_id, None)
                         if client is not None:
                             now_ts = time.time()
                             if client.current_user:
@@ -1394,10 +1425,14 @@ class TeacherDeployServer:
 
     def _ensure_broadcast_loop(self) -> None:
         if self.broadcast_thread is not None and self.broadcast_thread.is_alive():
+            self._broadcast_diag("producer_ensure_refused_alive")
             return
+        self._broadcast_diag("producer_event_clear_before_create")
         self.broadcast_stop_event.clear()
         self.broadcast_thread = threading.Thread(target=self._run_broadcast_loop, daemon=True)
+        self._broadcast_diag("producer_thread_created", worker_id=id(self.broadcast_thread))
         self.broadcast_thread.start()
+        self._broadcast_diag("producer_thread_started", worker_id=id(self.broadcast_thread))
 
     def _ensure_broadcast_audio_loop(self) -> None:
         if self.broadcast_audio_thread is not None and self.broadcast_audio_thread.is_alive():
@@ -1407,6 +1442,13 @@ class TeacherDeployServer:
         self.broadcast_audio_thread.start()
 
     def _run_broadcast_loop(self) -> None:
+        counters = {"frames_captured": 0, "frames_encoded": 0, "frames_attempted": 0, "frames_sent": 0, "send_failures": 0}
+        first_recipients = False
+        attempted_ids: set[str] = set()
+        sent_ids: set[str] = set()
+        failed_ids_logged: set[str] = set()
+        exit_reason = "unknown"
+        self._broadcast_diag("producer_worker_started")
         try:
             with mss.mss() as sct:
                 monitor = sct.monitors[1]
@@ -1414,10 +1456,14 @@ class TeacherDeployServer:
                     with self.lock:
                         target_ids = list(self.broadcast_target_ids)
                     if not target_ids:
+                        exit_reason = "no_targets"
                         break
 
                     width, height, jpeg_quality = self._broadcast_profile()
                     shot = sct.grab(monitor)
+                    counters["frames_captured"] += 1
+                    if counters["frames_captured"] == 1:
+                        self._broadcast_diag("producer_first_capture")
                     frame = cv2.cvtColor(numpy.array(shot), cv2.COLOR_BGRA2BGR)
                     if frame.shape[1] != width or frame.shape[0] != height:
                         frame = cv2.resize(frame, (width, height))
@@ -1425,6 +1471,9 @@ class TeacherDeployServer:
                     if not ok:
                         time.sleep(0.2)
                         continue
+                    counters["frames_encoded"] += 1
+                    if counters["frames_encoded"] == 1:
+                        self._broadcast_diag("producer_first_encode")
 
                     frame_bytes = jpeg.tobytes()
                     recipients: list[tuple[str, socket.socket]] = []
@@ -1435,14 +1484,30 @@ class TeacherDeployServer:
                                 continue
                             recipients.append((pc_id, client.broadcast_sock))
 
+                    if recipients and not first_recipients:
+                        first_recipients = True
+                        self._broadcast_diag("producer_first_recipient_snapshot", recipients=[pc for pc, _sock in recipients], socket_ids=[id(sock) for _pc, sock in recipients])
+
                     failed_ids: list[str] = []
                     failed_socks: list[socket.socket] = []
                     for pc_id, client_sock in recipients:
+                        counters["frames_attempted"] += 1
+                        if pc_id not in attempted_ids:
+                            attempted_ids.add(pc_id)
+                            self._broadcast_diag("producer_first_send_attempt", pc_id=pc_id, socket_id=id(client_sock))
                         try:
                             send_frame(client_sock, frame_bytes)
+                            counters["frames_sent"] += 1
+                            if pc_id not in sent_ids:
+                                sent_ids.add(pc_id)
+                                self._broadcast_diag("producer_first_send_success", pc_id=pc_id, socket_id=id(client_sock))
                         except OSError:
+                            counters["send_failures"] += 1
                             failed_ids.append(pc_id)
                             failed_socks.append(client_sock)
+                            if pc_id not in failed_ids_logged:
+                                failed_ids_logged.add(pc_id)
+                                self._broadcast_diag("producer_first_send_failure", pc_id=pc_id, socket_id=id(client_sock))
 
                     if failed_ids:
                         with self.lock:
@@ -1451,7 +1516,18 @@ class TeacherDeployServer:
                                 if client and client.broadcast_sock is failed_sock:
                                     client.broadcast_sock = None
                                 self.broadcast_target_ids.discard(pc_id)
+                                self.broadcast_target_session_ids.pop(pc_id, None)
                                 self._put_bounded(self.status_queue, pc_id)
+                                self._log_event(
+                                    "broadcast_diag",
+                                    diag_event="producer_target_removed_after_send_failure",
+                                    mono_ts=round(time.monotonic(), 6),
+                                    side="TEACHER",
+                                    thread_name=threading.current_thread().name,
+                                    thread_ident=threading.get_ident(),
+                                    pc_id=pc_id,
+                                    socket_id=id(failed_sock),
+                                )
                         for failed_sock in failed_socks:
                             try:
                                 failed_sock.close()
@@ -1459,10 +1535,15 @@ class TeacherDeployServer:
                                 pass
 
                     time.sleep(1 / max(1, RUNTIME.max_fps))
+                if exit_reason == "unknown" and self.broadcast_stop_event.is_set():
+                    exit_reason = "stop_event_set"
         except Exception as exc:
+            exit_reason = f"exception:{type(exc).__name__}"
             self._log_event("broadcast_loop_error", reason=str(exc))
         finally:
+            self._broadcast_diag("producer_finally", exit_reason=exit_reason, counters=counters)
             self.broadcast_stop_event.set()
+            self._broadcast_diag("producer_worker_terminated", exit_reason=exit_reason, counters=counters)
 
     def _run_broadcast_audio_loop(self) -> None:
         if sd is None:
@@ -1527,20 +1608,19 @@ class TeacherDeployServer:
                 ordered_targets.append(pc_id)
         if not ordered_targets:
             return []
+        self._broadcast_diag("start_entered", operation="START", requested_targets=ordered_targets)
 
-        # The UI normally invokes this method serially, but a separate gate also
-        # prevents two callers from interleaving their target rollbacks.  It is
-        # deliberately distinct from self.lock so socket I/O and joins never hold
-        # the shared server-state lock.
-        with self.lock:
-            start_gate = getattr(self, "_broadcast_start_gate", None)
-            if start_gate is None:
-                start_gate = threading.Lock()
-                self._broadcast_start_gate = start_gate
+        # The lifecycle gate is deliberately distinct from self.lock: stale
+        # worker joins occur without self.lock, preserving the existing lock
+        # ordering.  Stop snapshots target ownership before waiting on this gate.
+        start_gate = self.broadcast_lifecycle_gate
         if not start_gate.acquire(blocking=False):
+            self._broadcast_diag("start_gate_rejected", operation="START", requested_targets=ordered_targets)
             self._log_event("broadcast_start_aborted", reason="start_already_in_progress")
             return []
+        self._broadcast_diag("start_gate_acquired", operation="START", requested_targets=ordered_targets)
 
+        gate_held = True
         try:
             join_deadline = time.monotonic() + 2.0
             worker_ready_deadline = time.monotonic() + 2.5
@@ -1591,10 +1671,13 @@ class TeacherDeployServer:
                         )
 
                     for _worker_name, worker in workers:
+                        self._broadcast_diag("stale_worker_join_started", worker_name=_worker_name, worker_id=id(worker), stage=stage)
+                        join_started = time.monotonic()
                         remaining_s = max(0.0, join_deadline - time.monotonic())
                         if remaining_s <= 0.0:
                             break
                         worker.join(remaining_s)
+                        self._broadcast_diag("stale_worker_join_completed", worker_name=_worker_name, worker_id=id(worker), stage=stage, join_duration_s=round(time.monotonic() - join_started, 6), alive=worker.is_alive())
 
                     unreaped = [worker_name for worker_name, worker in workers if worker.is_alive()]
                     if unreaped:
@@ -1638,8 +1721,10 @@ class TeacherDeployServer:
                         # is confirmed dead; a live worker can otherwise set it in
                         # its finally block after this method creates a replacement.
                         if video_dead:
+                            self._log_event("broadcast_diag", diag_event="video_event_clear", side="TEACHER", mono_ts=round(time.monotonic(), 6), stage=stage)
                             self.broadcast_stop_event.clear()
                         if audio_dead:
+                            self._log_event("broadcast_diag", diag_event="audio_event_clear", side="TEACHER", mono_ts=round(time.monotonic(), 6), stage=stage)
                             self.broadcast_audio_stop_event.clear()
 
                     try:
@@ -1673,6 +1758,7 @@ class TeacherDeployServer:
                                 and bool(self.broadcast_target_ids)
                             )
                         if stable:
+                            self._broadcast_diag("producer_settle_succeeded", stage=stage, worker_id=id(candidate))
                             return True, ""
 
                     if time.monotonic() >= worker_ready_deadline:
@@ -1681,20 +1767,25 @@ class TeacherDeployServer:
                     time.sleep(poll_interval_s)
 
                 self._log_event("broadcast_start_aborted", reason="video_worker_not_stable", stage=stage)
+                self._broadcast_diag("producer_settle_failed", stage=stage, reason="video_worker_not_stable")
                 return False, "video_worker_not_stable"
 
             def rollback_targets(target_ids: set[str], reason: str, stop_targets: set[str]) -> None:
                 """Undo only targets reserved by this invocation, never active peers."""
-                rollback_ids = set(target_ids)
-                if not rollback_ids:
-                    return
                 with self.lock:
+                    rollback_ids = {
+                        pc_id for pc_id in target_ids
+                        if self.broadcast_target_session_ids.get(pc_id) == reserved_session_ids.get(pc_id)
+                    }
                     for pc_id in rollback_ids:
                         self.broadcast_target_ids.discard(pc_id)
+                        self.broadcast_target_session_ids.pop(pc_id, None)
                     no_targets_remain = not self.broadcast_target_ids
-                    if no_targets_remain:
+                    if rollback_ids and no_targets_remain:
                         self.broadcast_stop_event.set()
                         self.broadcast_audio_stop_event.set()
+                if not rollback_ids:
+                    return
 
                 for pc_id in sorted(stop_targets.intersection(rollback_ids)):
                     self.send_command(pc_id, "BROADCAST_STOP")
@@ -1731,6 +1822,7 @@ class TeacherDeployServer:
                     return []
 
             reserved_order: list[str] = []
+            reserved_session_ids: dict[str, int] = {}
             registration_baselines: dict[str, int] = {}
             for _attempt in range(3):
                 with self.lock:
@@ -1767,7 +1859,16 @@ class TeacherDeployServer:
                             self.broadcast_stop_event.clear()
                         if audio_thread is None or not audio_thread.is_alive():
                             self.broadcast_audio_stop_event.clear()
+                        if reserved_order and not current_targets:
+                            self.broadcast_session_id += 1
+                        active_session_id = self.broadcast_session_id
                         self.broadcast_target_ids.update(reserved_order)
+                        for pc_id in reserved_order:
+                            self.broadcast_target_session_ids[pc_id] = active_session_id
+                        reserved_session_ids = {
+                            pc_id: self.broadcast_target_session_ids[pc_id]
+                            for pc_id in reserved_order
+                        }
                         registration_baselines = {
                             pc_id: self.clients[pc_id].broadcast_generation
                             for pc_id in reserved_order
@@ -1786,6 +1887,14 @@ class TeacherDeployServer:
             if not ready:
                 rollback_targets(reserved_targets, failure_reason, set())
                 return []
+
+            # The transition is now committed: targets have session ownership and
+            # the producer is stable.  Release before control/socket I/O and the
+            # bounded registration wait.  A Stop that began before this Start is
+            # filtered by ownership; a later Stop is correctly ordered after it.
+            start_gate.release()
+            gate_held = False
+            self._broadcast_diag("start_gate_released_before_io", operation="START")
 
             # Do not duplicate BROADCAST_START for targets already in a healthy
             # session.  Revalidate newly reserved targets immediately before I/O.
@@ -1808,6 +1917,7 @@ class TeacherDeployServer:
             for pc_id in commandable:
                 cmd_id = self.send_command(pc_id, "BROADCAST_START")
                 if cmd_id:
+                    self._broadcast_diag("start_command_sent", operation="START", pc_id=pc_id, cmd_id=cmd_id)
                     sent_targets.add(pc_id)
                     self._put_bounded(self.status_queue, pc_id)
                 else:
@@ -1823,6 +1933,7 @@ class TeacherDeployServer:
                 return []
 
             pending = set(sent_targets)
+            self._broadcast_diag("registration_verification_started", operation="START", pending_targets=sorted(pending), baselines=registration_baselines)
             registered: set[str] = set()
             runtime_failures: set[str] = set()
             registration_deadline = time.monotonic() + registration_timeout_s
@@ -1904,40 +2015,68 @@ class TeacherDeployServer:
             started = [pc_id for pc_id in reserved_order if pc_id in final_ready]
             if started:
                 self._log_event("broadcast_started", targets=",".join(started), verified=True)
+                self._broadcast_diag("registration_verification_succeeded", operation="START", started=started)
+            else:
+                self._broadcast_diag("registration_verification_failed", operation="START", failed_targets=sorted(failed_targets))
+            self._broadcast_diag("start_return", operation="START", returned=started)
             return started
         finally:
-            start_gate.release()
+            if gate_held:
+                start_gate.release()
+                self._broadcast_diag("start_gate_released", operation="START")
 
     def stop_broadcast(self, targets: Optional[list[str]] = None) -> list[str]:
         sockets_to_close: list[socket.socket] = []
+        self._broadcast_diag("stop_entered", operation="STOP", requested_targets=targets)
+        # Capture the session ownership at invocation time, before waiting for an
+        # in-flight Start.  Once Start creates a later session, this Stop must not
+        # remove its targets or set its shared producer Events.
         with self.lock:
             current = set(self.broadcast_target_ids)
-            if targets is None:
-                target_set = current
-            else:
-                target_set = current.intersection(targets)
-            for pc_id in target_set:
-                client = self.clients.get(pc_id)
-                if client and client.broadcast_sock is not None:
-                    sockets_to_close.append(client.broadcast_sock)
-                    client.broadcast_sock = None
-                if client and client.broadcast_audio_sock is not None:
-                    sockets_to_close.append(client.broadcast_audio_sock)
-                    client.broadcast_audio_sock = None
-                self.broadcast_target_ids.discard(pc_id)
-        if not self.broadcast_target_ids:
-            self.broadcast_stop_event.set()
-            self.broadcast_audio_stop_event.set()
+            requested = current if targets is None else current.intersection(targets)
+            expected_sessions = {
+                pc_id: self.broadcast_target_session_ids.get(pc_id)
+                for pc_id in requested
+            }
+
+        with self.broadcast_lifecycle_gate:
+            with self.lock:
+                target_set = {
+                    pc_id for pc_id, session_id in expected_sessions.items()
+                    if (
+                        pc_id in self.broadcast_target_ids
+                        and self.broadcast_target_session_ids.get(pc_id) == session_id
+                    )
+                }
+                for pc_id in target_set:
+                    client = self.clients.get(pc_id)
+                    if client and client.broadcast_sock is not None:
+                        sockets_to_close.append(client.broadcast_sock)
+                        client.broadcast_sock = None
+                    if client and client.broadcast_audio_sock is not None:
+                        sockets_to_close.append(client.broadcast_audio_sock)
+                        client.broadcast_audio_sock = None
+                    self.broadcast_target_ids.discard(pc_id)
+                    self.broadcast_target_session_ids.pop(pc_id, None)
+                no_targets_remain = not self.broadcast_target_ids
+            if target_set and no_targets_remain:
+                self.broadcast_stop_event.set()
+                self.broadcast_audio_stop_event.set()
+                self._broadcast_diag("stop_events_set", operation="STOP")
+        self._broadcast_diag("stop_targets_removed", operation="STOP", stopped_targets=sorted(target_set), detached_socket_ids=[id(sock) for sock in sockets_to_close])
         for client_sock in sockets_to_close:
             try:
                 client_sock.close()
+                self._broadcast_diag("stop_socket_closed", operation="STOP", socket_id=id(client_sock))
             except OSError:
                 pass
         for pc_id in sorted(target_set):
-            self.send_command(pc_id, "BROADCAST_STOP")
+            cmd_id = self.send_command(pc_id, "BROADCAST_STOP")
+            self._broadcast_diag("stop_command_sent", operation="STOP", pc_id=pc_id, cmd_id=cmd_id)
             self._put_bounded(self.status_queue, pc_id)
         if target_set:
             self._log_event("broadcast_stopped", targets=",".join(sorted(target_set)))
+        self._broadcast_diag("stop_return", operation="STOP", returned=sorted(target_set))
         return sorted(target_set)
 
     def _video_client_loop(self, client_sock: socket.socket) -> None:
@@ -1951,11 +2090,15 @@ class TeacherDeployServer:
                 return
             pc_id = str(reg.get("pc_id", ""))
             role = str(reg.get("role", "uplink")).strip().lower() or "uplink"
+            registration_diag: dict[str, object] = {"pc_id": pc_id, "role": role, "accepted_socket_id": id(client_sock)}
             with self.lock:
                 if pc_id not in self.clients:
+                    self._log_event("broadcast_diag", diag_event="registration_unknown_client", side="TEACHER", mono_ts=round(time.monotonic(), 6), **registration_diag)
                     return
                 client = self.clients[pc_id]
                 if role == "broadcast_downlink":
+                    registration_diag.update({"client_online": client.online, "target_member": pc_id in self.broadcast_target_ids, "generation_before": client.broadcast_generation, "socket_before": id(client.broadcast_sock) if client.broadcast_sock else None})
+                    replaced = client.broadcast_sock is not None and client.broadcast_sock is not client_sock
                     if client.broadcast_sock and client.broadcast_sock is not client_sock:
                         try:
                             client.broadcast_sock.close()
@@ -1964,7 +2107,10 @@ class TeacherDeployServer:
                     client.broadcast_generation += 1
                     owned_video_generation = client.broadcast_generation
                     client.broadcast_sock = client_sock
+                    registration_diag.update({"generation_after": client.broadcast_generation, "socket_after": id(client.broadcast_sock), "replaced_socket": replaced})
                 elif role == "broadcast_audio_downlink":
+                    registration_diag.update({"client_online": client.online, "target_member": pc_id in self.broadcast_target_ids, "generation_before": client.broadcast_audio_generation, "socket_before": id(client.broadcast_audio_sock) if client.broadcast_audio_sock else None})
+                    replaced = client.broadcast_audio_sock is not None and client.broadcast_audio_sock is not client_sock
                     if client.broadcast_audio_sock and client.broadcast_audio_sock is not client_sock:
                         try:
                             client.broadcast_audio_sock.close()
@@ -1973,6 +2119,7 @@ class TeacherDeployServer:
                     client.broadcast_audio_generation += 1
                     owned_video_generation = client.broadcast_audio_generation
                     client.broadcast_audio_sock = client_sock
+                    registration_diag.update({"generation_after": client.broadcast_audio_generation, "socket_after": id(client.broadcast_audio_sock), "replaced_socket": replaced})
                 else:
                     if client.video_sock and client.video_sock is not client_sock:
                         try:
@@ -1982,6 +2129,8 @@ class TeacherDeployServer:
                     client.video_generation += 1
                     owned_video_generation = client.video_generation
                     client.video_sock = client_sock
+            if role in {"broadcast_downlink", "broadcast_audio_downlink"}:
+                self._broadcast_diag("downlink_registered", **registration_diag)
             if role == "broadcast_downlink":
                 self._log_event("broadcast_video_registered", pc_id=pc_id)
                 while True:
@@ -1993,8 +2142,10 @@ class TeacherDeployServer:
                             or client.broadcast_sock is not client_sock
                             or pc_id not in self.broadcast_target_ids
                         ):
+                            exit_reason = "generation_socket_or_target_changed"
                             break
                     time.sleep(0.5)
+                self._broadcast_diag("downlink_handler_exit", **registration_diag, exit_reason=exit_reason)
                 return
             if role == "broadcast_audio_downlink":
                 self._log_event("broadcast_audio_registered", pc_id=pc_id)
@@ -2007,8 +2158,10 @@ class TeacherDeployServer:
                             or client.broadcast_audio_sock is not client_sock
                             or pc_id not in self.broadcast_target_ids
                         ):
+                            exit_reason = "generation_socket_or_target_changed"
                             break
                     time.sleep(0.5)
+                self._broadcast_diag("audio_downlink_handler_exit", **registration_diag, exit_reason=exit_reason)
                 return
 
             self._log_event("video_registered", pc_id=pc_id)
@@ -4726,17 +4879,6 @@ def main() -> None:
 
 if __name__ == "__main__":
     main()
-
-
-
-
-
-
-
-
-
-
-
 
 
 
