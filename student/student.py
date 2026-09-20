@@ -86,6 +86,10 @@ class OverlayController:
         self._broadcast_image_label: Optional[ctk.CTkLabel] = None
         self._broadcast_status_label: Optional[ctk.CTkLabel] = None
         self._broadcast_photo: Optional[ImageTk.PhotoImage] = None
+        # This is deliberately independent of the Tk command queue.  A receiver
+        # thread can invalidate a session while an old frame is already queued.
+        self._broadcast_generation = 0
+        self._broadcast_generation_lock = threading.Lock()
         self._state = OverlayState.HIDDEN
         self._cmd_q: "queue.Queue[tuple[str, dict, threading.Event, dict]]" = queue.Queue()
         self._worker_started = False
@@ -1056,6 +1060,14 @@ class OverlayController:
                                 self._set_chat_enabled_ui(bool(payload.get("enabled", False)))
                                 result["ok"] = True
                             elif cmd == "broadcast_frame":
+                                generation = payload.get("generation")
+                                with self._broadcast_generation_lock:
+                                    current_generation = self._broadcast_generation
+                                if generation != current_generation:
+                                    # A frame from a prior TCP downlink must not
+                                    # repaint the overlay after Stop/Start.
+                                    result["ok"] = True
+                                    continue
                                 self._emit_broadcast_diag("ui_frame_dequeued", queue_size=self._cmd_q.qsize())
                                 self._render_broadcast_frame(payload.get("image"))
                                 result["ok"] = True
@@ -1167,11 +1179,16 @@ class OverlayController:
         except queue.Empty:
             return None
 
-    def show_broadcast_frame_async(self, image: Image.Image) -> bool:
+    def set_broadcast_generation(self, generation: int) -> None:
+        """Invalidate queued frames that do not belong to *generation*."""
+        with self._broadcast_generation_lock:
+            self._broadcast_generation = generation
+
+    def show_broadcast_frame_async(self, image: Image.Image, generation: int) -> bool:
         self._ensure_worker()
         if not self._ui_ready_event.is_set():
             return False
-        self._cmd_q.put(("broadcast_frame", {"image": image}, threading.Event(), {"ok": False}))
+        self._cmd_q.put(("broadcast_frame", {"image": image, "generation": generation}, threading.Event(), {"ok": False}))
         return True
 
     def clear_broadcast_frame_async(self) -> bool:
@@ -1345,6 +1362,10 @@ class StudentDeployClient:
         self.udp_send_lock = threading.Lock()
         self._showing_connection_overlay = False
         self.broadcast_active = False
+        # Monotonically identifies both active sessions and invalidated sessions.
+        # It is separate from the diagnostic counter so receiver ownership checks
+        # are synchronized with broadcast_active.
+        self.broadcast_generation = 0
         self._broadcast_audio_missing_warned = False
         self._broadcast_audio_device_warned = False
         self.logger = _student_logger()
@@ -1434,6 +1455,7 @@ class StudentDeployClient:
                 "signout_lock_active": bool(self.signout_lock_active),
                 "temporary_lock_active": bool(self.temporary_lock_active),
                 "broadcast_active": bool(self.broadcast_active),
+                "broadcast_generation": int(self.broadcast_generation),
             }
 
     def _update_state(self, **changes) -> None:
@@ -1600,20 +1622,33 @@ class StudentDeployClient:
         }
 
     def _start_broadcast_session(self) -> bool:
-        self.broadcast_diag_session += 1
+        with self.state_lock:
+            self.broadcast_generation += 1
+            generation = self.broadcast_generation
+            self.broadcast_active = True
+        self.broadcast_diag_session = generation
         self.broadcast_diag_first_frame_mono = None
         self._broadcast_diag("student_start_session_enter")
-        self._update_state(broadcast_active=True)
+        self.overlay.set_broadcast_generation(generation)
         self.overlay.clear_broadcast_frame_async()
         applied = self.overlay.set_state(OverlayState.BROADCAST)
         if not applied:
-            self._update_state(broadcast_active=False)
+            with self.state_lock:
+                if self.broadcast_generation == generation:
+                    self.broadcast_active = False
         self._broadcast_diag("student_start_session_complete", overlay_applied=applied)
         return applied
 
     def _stop_broadcast_session(self) -> bool:
         self._broadcast_diag("student_stop_session_enter")
-        self._update_state(broadcast_active=False)
+        # Invalidate before closing the socket: recv_frame() may return after a
+        # new Start has already installed a replacement socket.
+        with self.state_lock:
+            self.broadcast_generation += 1
+            generation = self.broadcast_generation
+            self.broadcast_active = False
+        self.broadcast_diag_session = generation
+        self.overlay.set_broadcast_generation(generation)
         self._close_broadcast_socket()
         self._close_broadcast_audio_socket()
         self.overlay.clear_broadcast_frame_async()
@@ -1942,19 +1977,27 @@ class StudentDeployClient:
         except OSError:
             return False
 
-    def _connect_broadcast_video(self) -> bool:
+    def _connect_broadcast_video(self, generation: int) -> bool:
         if not self.pc_id:
             self._broadcast_diag("receiver_connect_skipped_no_pc_id")
             return False
         self._broadcast_diag("receiver_connect_enter", receiver_state="CONNECTING")
+        sock: Optional[socket.socket] = None
         try:
             sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
             sock.connect((self.teacher_ip, NETWORK.video_port))
             send_json(sock, {"type": "video_register", "pc_id": self.pc_id, "role": "broadcast_downlink"})
             self._broadcast_diag("receiver_registration_sent", receiver_state="REGISTERED", local_socket_id=id(sock))
-            with self.conn_lock:
-                existing = self.broadcast_sock
-                self.broadcast_sock = sock
+            # Keep the active/generation check and publication ordered with Stop.
+            # Stop holds state_lock while invalidating, then closes the published
+            # socket; it therefore cannot leave a post-stop socket installed.
+            with self.state_lock:
+                if not self.broadcast_active or self.broadcast_generation != generation:
+                    sock.close()
+                    return False
+                with self.conn_lock:
+                    existing = self.broadcast_sock
+                    self.broadcast_sock = sock
             if existing is not None and existing is not sock:
                 try:
                     existing.close()
@@ -1962,6 +2005,11 @@ class StudentDeployClient:
                     pass
             return True
         except OSError as exc:
+            if sock is not None:
+                try:
+                    sock.close()
+                except OSError:
+                    pass
             self._broadcast_diag("receiver_connect_failed", receiver_state="RETRYING", reason=str(exc))
             return False
 
@@ -1993,10 +2041,26 @@ class StudentDeployClient:
     #             sock.close()
     #         except OSError:
     #             pass
-    def _close_broadcast_socket(self) -> None:
+    def _close_broadcast_socket(self, expected_sock: Optional[socket.socket] = None) -> None:
+        """Close the current video downlink only when this caller owns it.
+
+        A receiver blocked in recv_frame(old_sock) can wake after a new session
+        has installed new_sock.  Passing old_sock prevents that stale receiver
+        from clearing or closing new_sock.
+        """
         with self.conn_lock:
             sock = self.broadcast_sock
-            self.broadcast_sock = None
+            stale = expected_sock is not None and sock is not expected_sock
+            if not stale:
+                self.broadcast_sock = None
+
+        if stale:
+            self._broadcast_diag(
+                "receiver_socket_close_skipped_stale",
+                local_socket_id=id(expected_sock),
+                current_socket_id=id(sock) if sock else None,
+            )
+            return
 
         self._broadcast_diag("receiver_socket_close_begin", local_socket_id=id(sock) if sock else None)
 
@@ -2039,6 +2103,14 @@ class StudentDeployClient:
 
     def _cleanup_sockets(self) -> None:
         self._broadcast_diag("cleanup_sockets_begin")
+        with self.state_lock:
+            # Connection cleanup is another session boundary.  Invalidate queued
+            # frames before their socket is detached.
+            self.broadcast_generation += 1
+            generation = self.broadcast_generation
+            self.broadcast_active = False
+        self.broadcast_diag_session = generation
+        self.overlay.set_broadcast_generation(generation)
         with self.conn_lock:
             control_sock = self.control_sock
             video_sock = self.video_sock
@@ -2050,7 +2122,6 @@ class StudentDeployClient:
             self.broadcast_sock = None
             self.broadcast_audio_sock = None
             self.control_file = None
-        self._update_state(broadcast_active=False)
         if control_file is not None:
             try:
                 control_file.close()
@@ -2213,13 +2284,13 @@ class StudentDeployClient:
         self._broadcast_diag("receiver_worker_started", receiver_state="IDLE")
         last_idle = None
         while True:
+            sock: Optional[socket.socket] = None
             try:
                 snapshot = self._state_snapshot()
                 if not snapshot["broadcast_active"]:
                     if last_idle != snapshot["broadcast_active"]:
                         self._broadcast_diag("receiver_idle", receiver_state="IDLE")
                         last_idle = snapshot["broadcast_active"]
-                    self._close_broadcast_socket()
                     time.sleep(0.2)
                     continue
 
@@ -2231,7 +2302,7 @@ class StudentDeployClient:
                     if (not snapshot["connected"]) or (not self.pc_id):
                         time.sleep(0.2)
                         continue
-                    if not self._connect_broadcast_video():
+                    if not self._connect_broadcast_video(snapshot["broadcast_generation"]):
                         time.sleep(1)
                     continue
 
@@ -2245,8 +2316,25 @@ class StudentDeployClient:
                 if frame_data is None or log_recv_boundary:
                     self._broadcast_diag("receiver_recv_return", receiver_state="EOF" if frame_data is None else "FRAME_RECEIVED", local_socket_id=id(sock), field_matches_local=(self.broadcast_sock is sock), recv_duration_s=recv_duration, frame_size=len(frame_data) if frame_data else None)
                 if frame_data is None:
-                    self._close_broadcast_socket()
+                    self._close_broadcast_socket(sock)
                     time.sleep(0.2)
+                    continue
+                # recv_frame may have been unblocked by Stop, followed by a new
+                # Start.  Do not decode, enqueue, or clean up a newer session.
+                current = self._state_snapshot()
+                with self.conn_lock:
+                    still_owns_socket = self.broadcast_sock is sock
+                if (
+                    not current["broadcast_active"]
+                    or current["broadcast_generation"] != snapshot["broadcast_generation"]
+                    or not still_owns_socket
+                ):
+                    self._broadcast_diag(
+                        "receiver_frame_discarded_stale",
+                        local_socket_id=id(sock),
+                        receiver_generation=snapshot["broadcast_generation"],
+                        current_generation=current["broadcast_generation"],
+                    )
                     continue
                 self.broadcast_diag_counters["frames_received"] += 1
                 if self.broadcast_diag_first_frame_mono is None:
@@ -2261,18 +2349,39 @@ class StudentDeployClient:
                 if self.broadcast_diag_counters["frames_decoded"] == 1:
                     self._broadcast_diag("receiver_first_frame_decoded", receiver_state="FRAME_RECEIVED")
                 rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
-                queued = self.overlay.show_broadcast_frame_async(Image.fromarray(rgb))
+                # Decoding is not instantaneous; validate again immediately
+                # before handing the image to the asynchronous Tk queue.
+                current = self._state_snapshot()
+                with self.conn_lock:
+                    still_owns_socket = self.broadcast_sock is sock
+                if (
+                    not current["broadcast_active"]
+                    or current["broadcast_generation"] != snapshot["broadcast_generation"]
+                    or not still_owns_socket
+                ):
+                    self._broadcast_diag(
+                        "receiver_decoded_frame_discarded_stale",
+                        local_socket_id=id(sock),
+                        receiver_generation=snapshot["broadcast_generation"],
+                        current_generation=current["broadcast_generation"],
+                    )
+                    continue
+                queued = self.overlay.show_broadcast_frame_async(
+                    Image.fromarray(rgb), snapshot["broadcast_generation"]
+                )
                 if queued:
                     self.broadcast_diag_counters["frames_enqueued"] += 1
                 if self.broadcast_diag_counters["frames_enqueued"] == 1:
                     self._broadcast_diag("receiver_first_frame_enqueued", receiver_state="FRAME_RECEIVED", queued=queued)
             except OSError as exc:
                 self._broadcast_diag("receiver_socket_error", receiver_state="SOCKET_ERROR", reason=str(exc))
-                self._close_broadcast_socket()
+                # sock is intentionally local to the last recv iteration.  It
+                # may be stale, so cleanup must retain its identity.
+                self._close_broadcast_socket(locals().get("sock"))
                 time.sleep(0.5)
             except Exception as exc:
                 self._broadcast_diag("receiver_exception", receiver_state="RETRYING", reason=str(exc))
-                self._close_broadcast_socket()
+                self._close_broadcast_socket(locals().get("sock"))
                 time.sleep(0.5)
 
     def _broadcast_audio_receiver_loop(self) -> None:
@@ -2431,13 +2540,6 @@ def main() -> None:
 
 if __name__ == "__main__":
     main()
-
-
-
-
-
-
-
 
 
 
