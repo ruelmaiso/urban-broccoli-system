@@ -226,32 +226,104 @@ class ScreenShareBroadcaster:
             self._log("screen_share_capture_stopped", session_id=session_id)
 
     def _audio_producer(self, session_id: str) -> None:
-        """Capture default Windows playback through WASAPI loopback, never microphone input."""
-        stream = None
-        audio = None
+        """Mix WASAPI loopback and the default input into the existing PCM stream.
+
+        The wire contract remains signed 16-bit little-endian PCM at the configured
+        rate/channel count, so viewers still need only one playback stream.  Each
+        source owns its PyAudio instance: a failed microphone must not take down
+        loopback capture (and vice versa).
+        """
+        source_queues = {"system": queue.Queue(maxsize=4), "microphone": queue.Queue(maxsize=4)}
+        source_done = threading.Event()
         self._log("screen_share_audio_capture_started", session_id=session_id)
+
+        def normalize_pcm(chunk: bytes, source_rate: int, source_channels: int, state: object) -> tuple[bytes, object]:
+            samples = numpy.frombuffer(chunk, dtype=numpy.int16)
+            if samples.size % source_channels:
+                samples = samples[:samples.size - (samples.size % source_channels)]
+            samples = samples.reshape(-1, source_channels)
+            if source_channels == 1 and self.audio_channels == 2:
+                samples = numpy.repeat(samples, 2, axis=1)
+            elif source_channels == 2 and self.audio_channels == 1:
+                samples = samples.astype(numpy.int32).mean(axis=1, keepdims=True).astype(numpy.int16)
+            if source_rate != self.audio_rate:
+                target_frames = max(1, round(samples.shape[0] * self.audio_rate / source_rate))
+                source_axis = numpy.arange(samples.shape[0])
+                target_axis = numpy.linspace(0, samples.shape[0] - 1, target_frames)
+                samples = numpy.stack([numpy.interp(target_axis, source_axis, samples[:, channel]) for channel in range(self.audio_channels)], axis=1).astype(numpy.int16)
+            expected_samples = self.audio_chunk_frames * self.audio_channels
+            flattened = samples.reshape(-1)[:expected_samples]
+            if flattened.size < expected_samples:
+                flattened = numpy.pad(flattened, (0, expected_samples - flattened.size))
+            return flattened.astype(numpy.int16, copy=False).tobytes(), state
+
+        def capture_source(kind: str) -> None:
+            stream = audio = None
+            try:
+                import pyaudiowpatch as pyaudio
+                audio = pyaudio.PyAudio()
+                if kind == "system":
+                    device = audio.get_default_wasapi_loopback()
+                    if not device:
+                        raise RuntimeError("default WASAPI loopback device unavailable")
+                else:
+                    device = audio.get_default_input_device_info()
+                    if not device or device.get("isLoopbackDevice"):
+                        raise RuntimeError("default microphone input device unavailable")
+                source_channels = min(self.audio_channels, int(device.get("maxInputChannels", 0)))
+                if source_channels <= 0:
+                    raise RuntimeError("audio input device has no input channels")
+                source_rate = max(8000, int(float(device.get("defaultSampleRate", self.audio_rate))))
+                source_frames = max(1, round(self.audio_chunk_frames * source_rate / self.audio_rate))
+                stream = audio.open(format=pyaudio.paInt16, channels=source_channels, rate=source_rate,
+                                    input=True, input_device_index=device["index"], frames_per_buffer=source_frames)
+                self._log("screen_share_audio_source_started", session_id=session_id, source=kind,
+                          rate=source_rate, channels=source_channels, chunk_frames=source_frames)
+                rate_state = None
+                while self._session_current(session_id) and not source_done.is_set():
+                    raw = stream.read(source_frames, exception_on_overflow=False)
+                    chunk, rate_state = normalize_pcm(raw, source_rate, source_channels, rate_state)
+                    try:
+                        source_queues[kind].put_nowait(chunk)
+                    except queue.Full:
+                        try: source_queues[kind].get_nowait()
+                        except queue.Empty: pass
+                        try: source_queues[kind].put_nowait(chunk)
+                        except queue.Full: pass
+            except Exception as exc:
+                self._log("screen_share_audio_source_failed", session_id=session_id, source=kind, reason=str(exc))
+            finally:
+                if stream:
+                    try: stream.stop_stream(); stream.close()
+                    except Exception: pass
+                if audio:
+                    try: audio.terminate()
+                    except Exception: pass
+
+        workers = [threading.Thread(target=capture_source, args=(kind,), daemon=True,
+                                    name=f"screen-share-{kind}-audio") for kind in source_queues]
+        for worker in workers:
+            worker.start()
+        expected = self.audio_chunk_frames * self.audio_channels * 2
+        silence = b"\0" * expected
+        latest = {"system": silence, "microphone": silence}
         try:
-            import pyaudiowpatch as pyaudio
-            audio = pyaudio.PyAudio()
-            loopback = audio.get_default_wasapi_loopback()
-            if not loopback:
-                raise RuntimeError("default WASAPI loopback device unavailable")
-            channels = self.audio_channels
-            if int(loopback["maxInputChannels"]) < channels:
-                raise RuntimeError("default WASAPI loopback device does not support configured channel count")
-            stream = audio.open(format=pyaudio.paInt16, channels=channels, rate=self.audio_rate,
-                                input=True, input_device_index=loopback["index"],
-                                frames_per_buffer=self.audio_chunk_frames)
             while self._session_current(session_id):
-                chunk = stream.read(self.audio_chunk_frames, exception_on_overflow=False)
-                self._distribute("audio", chunk)
-        except Exception as exc:
-            self._log("screen_share_audio_capture_failed", session_id=session_id, reason=str(exc))
+                produced = False
+                for kind, packets in source_queues.items():
+                    try:
+                        latest[kind] = packets.get(timeout=0.02 if kind == "system" else 0.0)
+                        produced = True
+                    except queue.Empty:
+                        latest[kind] = silence
+                if produced:
+                    # -6 dB per source prevents clipping when both are loud.
+                    system = numpy.frombuffer(latest["system"], dtype=numpy.int16).astype(numpy.int32)
+                    microphone = numpy.frombuffer(latest["microphone"], dtype=numpy.int16).astype(numpy.int32)
+                    mixed = numpy.clip((system + microphone) // 2, -32768, 32767).astype(numpy.int16).tobytes()
+                    self._distribute("audio", mixed)
+                else:
+                    time.sleep(self.audio_chunk_frames / self.audio_rate)
         finally:
-            if stream:
-                try: stream.stop_stream(); stream.close()
-                except Exception: pass
-            if audio:
-                try: audio.terminate()
-                except Exception: pass
+            source_done.set()
             self._log("screen_share_audio_capture_stopped", session_id=session_id)

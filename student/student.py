@@ -1308,6 +1308,7 @@ class StudentDeployClient:
         self.screen_share_video_sock: Optional[socket.socket] = None
         self.screen_share_audio_sock: Optional[socket.socket] = None
         self.screen_share_audio_queue: "queue.Queue[bytes]" = queue.Queue(maxsize=8)
+        self.screen_share_timer_paused_by_client = False
 
     def get_teacher_ip(self) -> str:
         return self.teacher_ip
@@ -1547,6 +1548,14 @@ class StudentDeployClient:
             self.screen_share_audio_chunk_frames = int(msg.get("audio_chunk_frames", RUNTIME.screen_share_audio_chunk_frames))
             self.screen_share_stop = threading.Event()
             stop = self.screen_share_stop
+        # Do not overwrite another pause reason (for example an administrator's
+        # temporary lock).  The server remains the authoritative timer owner.
+        with self.timer_manager.lock:
+            session_timer = self.timer_manager.timers.get(self.session_timer_id)
+            can_pause = bool(session_timer and not session_timer.get("paused") and not session_timer.get("cancelled") and not session_timer.get("expired"))
+        self.screen_share_timer_paused_by_client = can_pause
+        if can_pause:
+            self.timer_manager.pause_timer(self.session_timer_id)
         self.overlay.start_screen_share_async(session_id)
         threading.Thread(target=self._screen_share_video_loop, args=(session_id, stop), daemon=True).start()
         threading.Thread(target=self._screen_share_audio_receive_loop, args=(session_id, stop), daemon=True).start()
@@ -1559,10 +1568,14 @@ class StudentDeployClient:
             active = self.screen_share_session_id
             self.screen_share_session_id = ""
             self.screen_share_stop.set()
+            resume_timer = self.screen_share_timer_paused_by_client
+            self.screen_share_timer_paused_by_client = False
         self._close_screen_share_sockets()
         while not self.screen_share_audio_queue.empty():
             try: self.screen_share_audio_queue.get_nowait()
             except queue.Empty: break
+        if resume_timer:
+            self.timer_manager.resume_timer(self.session_timer_id)
         if show_ui:
             self.overlay.stop_screen_share_async(self._screen_share_restore_state())
         if active:
@@ -1980,6 +1993,10 @@ class StudentDeployClient:
                     sock.close()
                 except OSError:
                     pass
+        # A lost control channel means the teacher can no longer reliably own
+        # this share session.  Release only the pause created by screen share.
+        if self.screen_share_session_id:
+            self._stop_screen_share()
 
     def _reconnect_loop(self) -> None:
         while True:
