@@ -13,6 +13,8 @@ class NetworkConfig:
     video_port: int = 9200
     sensor_port: int = 9202
     command_fallback_port: int = 9203
+    screen_share_video_port: int = 9204
+    screen_share_audio_port: int = 9205
 
 
 @dataclass(frozen=True)
@@ -29,6 +31,13 @@ class RuntimeConfig:
     sensor_timeout_s: int = 10
     timer_tick_s: float = 0.5
     session_disconnect_grace_s: int = 30
+    screen_share_width: int = 1280
+    screen_share_height: int = 720
+    screen_share_fps: int = 15
+    screen_share_jpeg_quality: int = 78
+    screen_share_audio_rate: int = 44100
+    screen_share_audio_channels: int = 2
+    screen_share_audio_chunk_frames: int = 1024
 
 
 NETWORK = NetworkConfig()
