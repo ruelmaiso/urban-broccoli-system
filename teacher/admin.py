@@ -1513,7 +1513,13 @@ class TeacherDeployServer:
                         with self.lock:
                             for pc_id, failed_sock in zip(failed_ids, failed_socks):
                                 client = self.clients.get(pc_id)
-                                if client and client.broadcast_sock is failed_sock:
+                                # The recipient list is a snapshot.  A Stop/Start
+                                # can replace this downlink before send_frame()
+                                # reports the old socket's failure.  That old
+                                # failure must not remove the replacement target.
+                                if client and client.broadcast_sock is not failed_sock:
+                                    continue
+                                if client:
                                     client.broadcast_sock = None
                                 self.broadcast_target_ids.discard(pc_id)
                                 self.broadcast_target_session_ids.pop(pc_id, None)
@@ -4879,7 +4885,6 @@ def main() -> None:
 
 if __name__ == "__main__":
     main()
-
 
 
 
