@@ -6,3 +6,5 @@ mss
 pyinstaller
 psutil
 sounddevice
+
+PyAudioWPatch

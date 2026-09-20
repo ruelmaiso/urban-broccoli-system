@@ -30,6 +30,7 @@ from core.auth_db import AuthDatabase
 from core.client_registry import ClientRegistry
 from core.heartbeat import HeartbeatState
 from core.protocol import recv_frame, recv_json_line, send_frame, send_json
+from core.screen_share import ScreenShareBroadcaster
 from core.app_settings import AppSettings, SettingsStore
 from teacher.reservations import ReservationManager
 from teacher.ui.student_management import StudentManagementPanel
@@ -162,7 +163,7 @@ STATUS_COLORS = THEME_STATUS_COLORS
 CONVERSATION_TTL_S = 6 * 60 * 60
 CONVERSATION_MAX_PCS = 500
 
-VALID_COMMAND_ACKS = {"LOCK_NOW", "UNLOCK_NOW", "SET_TIMER", "EXTEND_TIMER", "CANCEL_TIMER", "TIMER_EXPIRED", "TIMER_WARNING", "SET_STREAM_PROFILE", "SET_RUNTIME_TUNING", "SESSION_MESSAGE", "EXTENSION_REQUEST", "EXTENSION_OFFER", "PAUSE_TIMER", "RESUME_TIMER", "SHUTDOWN", "RESTART"}
+VALID_COMMAND_ACKS = {"LOCK_NOW", "UNLOCK_NOW", "SET_TIMER", "EXTEND_TIMER", "CANCEL_TIMER", "TIMER_EXPIRED", "TIMER_WARNING", "SET_STREAM_PROFILE", "SET_RUNTIME_TUNING", "SESSION_MESSAGE", "EXTENSION_REQUEST", "EXTENSION_OFFER", "PAUSE_TIMER", "RESUME_TIMER", "SHUTDOWN", "RESTART", "SCREEN_SHARE_START", "SCREEN_SHARE_STOP"}
 ERROR_CODES = {
     "CONTROL_VALIDATION_ERROR",
     "SENSOR_VALIDATION_ERROR",
@@ -217,6 +218,13 @@ class TeacherDeployServer:
         self.video_status_last_ts_by_pc: dict[str, float] = {}
         self.udp_send_sock: Optional[socket.socket] = None
         self.udp_send_lock = threading.Lock()
+        self.screen_share = ScreenShareBroadcaster(
+            self.settings.teacher_bind_host, NETWORK.screen_share_video_port, NETWORK.screen_share_audio_port,
+            width=RUNTIME.screen_share_width, height=RUNTIME.screen_share_height,
+            fps=RUNTIME.screen_share_fps, jpeg_quality=RUNTIME.screen_share_jpeg_quality,
+            audio_rate=RUNTIME.screen_share_audio_rate, audio_channels=RUNTIME.screen_share_audio_channels,
+            audio_chunk_frames=RUNTIME.screen_share_audio_chunk_frames, log=self._log_event,
+        )
         self.timers_file = ROOT / "data" / "active_timers.json"
         self.session_timers_file = ROOT / "data" / "active_session_timers.json"
         self.auth_db.close_all_active_recordings(status="server_restart")
@@ -567,6 +575,7 @@ class TeacherDeployServer:
             time.sleep(5)
 
     def start(self) -> None:
+        self.screen_share.start_services()
         threading.Thread(target=self._run_control_server, daemon=True).start()
         threading.Thread(target=self._run_video_server, daemon=True).start()
         threading.Thread(target=self._run_sensor_server, daemon=True).start()
@@ -678,6 +687,9 @@ class TeacherDeployServer:
                         "max_fps": RUNTIME.max_fps,
                     })
                     self.send_command(assigned, "SET_RUNTIME_TUNING", {"reconnect_interval_s": int(self.settings.reconnect_interval_s)})
+                    active_screen_share = self.screen_share.active_session_id
+                    if active_screen_share:
+                        self._send_screen_share_start(assigned, active_screen_share)
                     if assigned in self.pending_signout_lock_pc_ids:
                         with self.lock:
                             client_ref = self.clients.get(assigned)
@@ -1667,7 +1679,7 @@ class TeacherDeployServer:
             })
 
     def send_command(self, pc_id: str, command: str, payload: Optional[dict] = None, *, allow_udp_fallback: bool = True) -> Optional[str]:
-        if command in {"SHUTDOWN", "RESTART"}:
+        if command in {"SHUTDOWN", "RESTART", "SCREEN_SHARE_START", "SCREEN_SHARE_STOP"}:
             allow_udp_fallback = False
         with self.lock:
             client = self.clients.get(pc_id)
@@ -1702,6 +1714,37 @@ class TeacherDeployServer:
             except OSError:
                 return None
         return None
+
+    def _send_screen_share_start(self, pc_id: str, session_id: str) -> Optional[str]:
+        return self.send_command(pc_id, "SCREEN_SHARE_START", {
+            "session_id": session_id,
+            "video_port": NETWORK.screen_share_video_port,
+            "audio_port": NETWORK.screen_share_audio_port,
+            "width": RUNTIME.screen_share_width,
+            "height": RUNTIME.screen_share_height,
+            "fps": RUNTIME.screen_share_fps,
+            "audio_rate": RUNTIME.screen_share_audio_rate,
+            "audio_channels": RUNTIME.screen_share_audio_channels,
+            "audio_chunk_frames": RUNTIME.screen_share_audio_chunk_frames,
+        })
+
+    def start_screen_share(self) -> tuple[str, int]:
+        self._log_event("SCREEN_SHARE_START_REQUESTED")
+        session_id = self.screen_share.start_session()
+        with self.lock:
+            targets = [pc_id for pc_id, client in self.clients.items() if client.online and client.control_sock]
+        for pc_id in targets:
+            self._send_screen_share_start(pc_id, session_id)
+        return session_id, len(targets)
+
+    def stop_screen_share(self) -> None:
+        self._log_event("SCREEN_SHARE_STOP_REQUESTED")
+        session_id = self.screen_share.active_session_id
+        self.screen_share.stop_session()
+        with self.lock:
+            targets = [pc_id for pc_id, client in self.clients.items() if client.online and client.control_sock]
+        for pc_id in targets:
+            self.send_command(pc_id, "SCREEN_SHARE_STOP", {"session_id": session_id})
 
     def shutdown_targets(self, targets: list[str]) -> list[str]:
         with self.lock:
@@ -1993,6 +2036,10 @@ class TeacherDeployUI:
         self.top_title_label.pack(side="left")
         self.settings_button = ctk.CTkButton(title_row, text="Settings", command=self._open_settings_modal, width=110, height=34, **BUTTON_NEUTRAL)
         self.settings_button.pack(side="right", padx=(8, 0))
+        self.screen_share_button = ctk.CTkButton(
+            title_row, text="Share Screen", command=self._toggle_screen_share, width=140, height=34, **BUTTON_PRIMARY
+        )
+        self.screen_share_button.pack(side="right", padx=(8, 0))
         self.reservations_button = ctk.CTkButton(
             title_row,
             text="Reservations",
@@ -2296,6 +2343,24 @@ class TeacherDeployUI:
         detail = "".join(traceback.format_exception(exc, val, tb))[-4000:]
         self.server._log_event("ui_callback_error", detail=detail)
         self._set_runtime_notice("Dashboard recovered after a UI callback issue.", ESSU_WARNING, hold_s=20.0)
+
+    def _toggle_screen_share(self) -> None:
+        if self.server.screen_share.active_session_id:
+            self.server.stop_screen_share()
+            self._set_runtime_notice("Screen sharing stopped.", ESSU_WARNING, hold_s=8.0)
+        else:
+            _session_id, target_count = self.server.start_screen_share()
+            self._set_runtime_notice(f"Screen sharing started for {target_count} online student(s).", ESSU_PRIMARY, hold_s=8.0)
+        self._refresh_screen_share_button()
+
+    def _refresh_screen_share_button(self) -> None:
+        active = bool(self.server.screen_share.active_session_id)
+        viewers = self.server.screen_share.viewer_count()
+        self._configure_if_changed(
+            self.screen_share_button,
+            text=(f"Stop Sharing ({viewers})" if active else "Share Screen"),
+            fg_color=(ESSU_ERROR if active else BUTTON_PRIMARY.get("fg_color")),
+        )
 
     def _on_close_requested(self) -> None:
         if messagebox.askyesno(
@@ -3998,6 +4063,7 @@ class TeacherDeployUI:
                 self._update_sensor_panel(self.selected_pc)
 
             self._refresh_control_buttons()
+            self._refresh_screen_share_button()
         except Exception as exc:
             self.server._log_event("ui_drain_error", reason=str(exc))
             self._set_runtime_notice("Dashboard recovered after a refresh issue.", ESSU_WARNING, hold_s=20.0)
@@ -4008,7 +4074,10 @@ class TeacherDeployUI:
                 pass
 
     def run(self) -> None:
-        self.root.mainloop()
+        try:
+            self.root.mainloop()
+        finally:
+            self.server.screen_share.shutdown()
 
 
 def main() -> None:

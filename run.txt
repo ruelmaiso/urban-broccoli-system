@@ -1,17 +1,17 @@
 stu
 
-pyinstaller --clean --onefile --noconsole --name ESSU-SLMS-StudentAgent --icon assets/app_icon.ico --paths . --hidden-import core.runtime_paths --hidden-import config.deploy_settings --hidden-import core.protocol --hidden-import mss --hidden-import mss.windows --collect-all customtkinter --collect-all cv2 --collect-all PIL --collect-all numpy --collect-all psutil --add-data "config;config" --add-data "assets;assets" student/student.py
+pyinstaller --clean --onefile --noconsole --name ESSU-SLMS-StudentAgent --icon assets/app_icon.ico --paths . --hidden-import core.runtime_paths --hidden-import config.deploy_settings --hidden-import core.protocol --hidden-import mss --hidden-import mss.windows --collect-all customtkinter --collect-all cv2 --collect-all PIL --collect-all numpy --collect-all psutil --collect-all pyaudiowpatch --add-data "config;config" --add-data "assets;assets" student/student.py
 
 
 adm
 
-pyinstaller --clean --onedir --noconsole --name ESSU-SLMS-TeacherAdmin --icon assets/app_icon.ico --paths . --hidden-import core.runtime_paths --hidden-import config.deploy_settings --hidden-import core.auth_db --hidden-import core.client_registry --hidden-import core.heartbeat --hidden-import core.protocol --hidden-import core.app_settings --hidden-import teacher.reservations --hidden-import teacher.ui.student_management --hidden-import teacher.ui.reservation_management --collect-all customtkinter --collect-all cv2 --collect-all PIL --collect-all numpy --collect-all psutil --add-data "assets;assets" --add-data "config;config" --add-data "data;data" --add-data "client_registry.json;." teacher/admin.py
+pyinstaller --clean --onedir --noconsole --name ESSU-SLMS-TeacherAdmin --icon assets/app_icon.ico --paths . --hidden-import core.runtime_paths --hidden-import config.deploy_settings --hidden-import core.auth_db --hidden-import core.client_registry --hidden-import core.heartbeat --hidden-import core.protocol --hidden-import core.app_settings --hidden-import teacher.reservations --hidden-import teacher.ui.student_management --hidden-import teacher.ui.reservation_management --collect-all customtkinter --collect-all cv2 --collect-all PIL --collect-all numpy --collect-all psutil --collect-all pyaudiowpatch --add-data "assets;assets" --add-data "config;config" --add-data "data;data" --add-data "client_registry.json;." teacher/admin.py
 
 
 
 old student
 
-pyinstaller --clean --onefile --noconsole --name ESSU-SLMS-StudentAgent --icon assets/app_icon.ico --paths=. --add-data "assets;assets" --add-data "config;config" --add-data "data;data" --collect-all core --collect-all customtkinter --collect-all PIL --collect-all cv2 --collect-all mss student/student.py
+pyinstaller --clean --onefile --noconsole --name ESSU-SLMS-StudentAgent --icon assets/app_icon.ico --paths=. --add-data "assets;assets" --add-data "config;config" --add-data "data;data" --collect-all core --collect-all customtkinter --collect-all PIL --collect-all cv2 --collect-all mss --collect-all pyaudiowpatch student/student.py
 
 
 
