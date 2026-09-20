@@ -30,6 +30,7 @@ from core.auth_db import AuthDatabase
 from core.client_registry import ClientRegistry
 from core.heartbeat import HeartbeatState
 from core.protocol import recv_frame, recv_json_line, send_frame, send_json
+from core.screen_share import ScreenShareBroadcaster
 from core.app_settings import AppSettings, SettingsStore
 from teacher.reservations import ReservationManager
 from teacher.ui.student_management import StudentManagementPanel
@@ -105,6 +106,7 @@ class TimerState:
     paused: bool = False
     paused_at_ts: Optional[float] = None
     paused_accum_ms: int = 0
+    screen_share_paused: bool = False
 
 
 @dataclass
@@ -162,7 +164,7 @@ STATUS_COLORS = THEME_STATUS_COLORS
 CONVERSATION_TTL_S = 6 * 60 * 60
 CONVERSATION_MAX_PCS = 500
 
-VALID_COMMAND_ACKS = {"LOCK_NOW", "UNLOCK_NOW", "SET_TIMER", "EXTEND_TIMER", "CANCEL_TIMER", "TIMER_EXPIRED", "TIMER_WARNING", "SET_STREAM_PROFILE", "SET_RUNTIME_TUNING", "SESSION_MESSAGE", "EXTENSION_REQUEST", "EXTENSION_OFFER", "PAUSE_TIMER", "RESUME_TIMER", "SHUTDOWN", "RESTART"}
+VALID_COMMAND_ACKS = {"LOCK_NOW", "UNLOCK_NOW", "SET_TIMER", "EXTEND_TIMER", "CANCEL_TIMER", "TIMER_EXPIRED", "TIMER_WARNING", "SET_STREAM_PROFILE", "SET_RUNTIME_TUNING", "SESSION_MESSAGE", "EXTENSION_REQUEST", "EXTENSION_OFFER", "PAUSE_TIMER", "RESUME_TIMER", "SHUTDOWN", "RESTART", "SCREEN_SHARE_START", "SCREEN_SHARE_STOP"}
 ERROR_CODES = {
     "CONTROL_VALIDATION_ERROR",
     "SENSOR_VALIDATION_ERROR",
@@ -217,6 +219,13 @@ class TeacherDeployServer:
         self.video_status_last_ts_by_pc: dict[str, float] = {}
         self.udp_send_sock: Optional[socket.socket] = None
         self.udp_send_lock = threading.Lock()
+        self.screen_share = ScreenShareBroadcaster(
+            self.settings.teacher_bind_host, NETWORK.screen_share_video_port, NETWORK.screen_share_audio_port,
+            width=RUNTIME.screen_share_width, height=RUNTIME.screen_share_height,
+            fps=RUNTIME.screen_share_fps, jpeg_quality=RUNTIME.screen_share_jpeg_quality,
+            audio_rate=RUNTIME.screen_share_audio_rate, audio_channels=RUNTIME.screen_share_audio_channels,
+            audio_chunk_frames=RUNTIME.screen_share_audio_chunk_frames, log=self._log_event,
+        )
         self.timers_file = ROOT / "data" / "active_timers.json"
         self.session_timers_file = ROOT / "data" / "active_session_timers.json"
         self.auth_db.close_all_active_recordings(status="server_restart")
@@ -232,6 +241,7 @@ class TeacherDeployServer:
                         if client_ref:
                             client_ref.session_timer = timer
         self._load_persisted_timers()
+        self._clear_orphaned_screen_share_pauses()
 
     def _load_active_sessions_from_db(self) -> None:
         now = time.time()
@@ -282,6 +292,7 @@ class TeacherDeployServer:
             "paused": bool(timer.paused),
             "paused_at_ts": float(timer.paused_at_ts) if timer.paused_at_ts is not None else None,
             "paused_accum_ms": int(timer.paused_accum_ms),
+            "screen_share_paused": bool(timer.screen_share_paused),
         }
 
     def _session_timer_from_payload(self, pc_id: str, payload: object) -> Optional[TimerState]:
@@ -296,6 +307,7 @@ class TeacherDeployServer:
             timer.paused = bool(payload.get("paused", False))
             timer.paused_at_ts = float(payload.get("paused_at_ts")) if payload.get("paused_at_ts") is not None else None
             timer.paused_accum_ms = max(0, int(payload.get("paused_accum_ms", 0)))
+            timer.screen_share_paused = bool(payload.get("screen_share_paused", False))
             return timer
         except Exception:
             return None
@@ -348,6 +360,7 @@ class TeacherDeployServer:
                 "paused": bool(timer.paused),
                 "paused_at_ts": timer.paused_at_ts,
                 "paused_accum_ms": int(timer.paused_accum_ms),
+                "screen_share_paused": bool(timer.screen_share_paused),
             })
         try:
             _write_json_atomic(self.timers_file, payload)
@@ -382,6 +395,7 @@ class TeacherDeployServer:
                     paused=bool(row.get("paused", False)),
                     paused_at_ts=float(row.get("paused_at_ts")) if row.get("paused_at_ts") is not None else None,
                     paused_accum_ms=int(row.get("paused_accum_ms", 0)),
+                    screen_share_paused=bool(row.get("screen_share_paused", False)),
                 )
             except Exception:
                 continue
@@ -567,6 +581,7 @@ class TeacherDeployServer:
             time.sleep(5)
 
     def start(self) -> None:
+        self.screen_share.start_services()
         threading.Thread(target=self._run_control_server, daemon=True).start()
         threading.Thread(target=self._run_video_server, daemon=True).start()
         threading.Thread(target=self._run_sensor_server, daemon=True).start()
@@ -678,6 +693,15 @@ class TeacherDeployServer:
                         "max_fps": RUNTIME.max_fps,
                     })
                     self.send_command(assigned, "SET_RUNTIME_TUNING", {"reconnect_interval_s": int(self.settings.reconnect_interval_s)})
+                    active_screen_share = self.screen_share.active_session_id
+                    if active_screen_share:
+                        with self.lock:
+                            timer = self.clients.get(assigned).session_timer if assigned in self.clients else None
+                            pause_timer = bool(timer and timer.screen_share_paused)
+                        self._send_screen_share_start(assigned, active_screen_share, pause_timer=pause_timer)
+                    else:
+                        # A reconnecting client may still have a local share overlay/timer pause.
+                        self.send_command(assigned, "SCREEN_SHARE_STOP", {"session_id": "", "resume_timer": True})
                     if assigned in self.pending_signout_lock_pc_ids:
                         with self.lock:
                             client_ref = self.clients.get(assigned)
@@ -1667,7 +1691,7 @@ class TeacherDeployServer:
             })
 
     def send_command(self, pc_id: str, command: str, payload: Optional[dict] = None, *, allow_udp_fallback: bool = True) -> Optional[str]:
-        if command in {"SHUTDOWN", "RESTART"}:
+        if command in {"SHUTDOWN", "RESTART", "SCREEN_SHARE_START", "SCREEN_SHARE_STOP"}:
             allow_udp_fallback = False
         with self.lock:
             client = self.clients.get(pc_id)
@@ -1702,6 +1726,102 @@ class TeacherDeployServer:
             except OSError:
                 return None
         return None
+
+    def _send_screen_share_start(self, pc_id: str, session_id: str, *, pause_timer: bool = False) -> Optional[str]:
+        return self.send_command(pc_id, "SCREEN_SHARE_START", {
+            "session_id": session_id,
+            "video_port": NETWORK.screen_share_video_port,
+            "audio_port": NETWORK.screen_share_audio_port,
+            "width": RUNTIME.screen_share_width,
+            "height": RUNTIME.screen_share_height,
+            "fps": RUNTIME.screen_share_fps,
+            "audio_rate": RUNTIME.screen_share_audio_rate,
+            "audio_channels": RUNTIME.screen_share_audio_channels,
+            "audio_chunk_frames": RUNTIME.screen_share_audio_chunk_frames,
+            "pause_timer": bool(pause_timer),
+        })
+
+    def eligible_screen_share_targets(self) -> list[str]:
+        with self.lock:
+            return [pc_id for pc_id, client in self.clients.items() if client.online and client.control_sock]
+
+    def _pause_session_timers_for_screen_share(self, targets: list[str]) -> set[str]:
+        now = time.time()
+        paused_by_share: set[str] = set()
+        with self.lock:
+            for pc_id in targets:
+                client = self.clients.get(pc_id)
+                timer = client.session_timer if client else None
+                if not client or not client.current_user or timer is None or timer.paused:
+                    continue
+                timer.paused = True
+                timer.paused_at_ts = now
+                timer.screen_share_paused = True
+                paused_by_share.add(pc_id)
+        if paused_by_share:
+            self._persist_session_timers()
+        return paused_by_share
+
+    def _resume_session_timers_for_screen_share(self) -> set[str]:
+        now = time.time()
+        resumed: set[str] = set()
+        with self.lock:
+            for pc_id, client in self.clients.items():
+                timer = client.session_timer
+                if timer is None or not timer.screen_share_paused:
+                    continue
+                if timer.paused_at_ts is not None:
+                    timer.paused_accum_ms += max(0, int((now - timer.paused_at_ts) * 1000))
+                timer.paused_at_ts = None
+                timer.paused = False
+                timer.screen_share_paused = False
+                resumed.add(pc_id)
+        if resumed:
+            self._persist_session_timers()
+        return resumed
+
+    def _clear_orphaned_screen_share_pauses(self) -> None:
+        # A restarted teacher has no active media session, so only screen-share pauses are released.
+        now = time.time()
+        resumed: set[str] = set()
+        with self.lock:
+            for pc_id, entry in self.active_sessions_by_pc_id.items():
+                payload = entry.get("session_timer") if isinstance(entry, dict) else None
+                if not isinstance(payload, dict) or not payload.get("screen_share_paused"):
+                    continue
+                paused_at = payload.get("paused_at_ts")
+                if isinstance(paused_at, (int, float)):
+                    payload["paused_accum_ms"] = int(payload.get("paused_accum_ms", 0)) + max(0, int((now - float(paused_at)) * 1000))
+                payload["paused"] = False
+                payload["paused_at_ts"] = None
+                payload["screen_share_paused"] = False
+                resumed.add(pc_id)
+        resumed.update(self._resume_session_timers_for_screen_share())
+        if resumed:
+            self._persist_session_timers()
+            self._log_event("screen_share_orphaned_timer_pauses_cleared", pc_ids=sorted(resumed))
+
+    def start_screen_share(self) -> tuple[str, int]:
+        if self.screen_share.active_session_id:
+            self.stop_screen_share()
+        targets = self.eligible_screen_share_targets()
+        if not targets:
+            self._log_event("SCREEN_SHARE_START_REJECTED", reason="no_eligible_students")
+            return "", 0
+        self._log_event("SCREEN_SHARE_START_REQUESTED", targets=targets)
+        session_id = self.screen_share.start_session()
+        paused_by_share = self._pause_session_timers_for_screen_share(targets)
+        for pc_id in targets:
+            self._send_screen_share_start(pc_id, session_id, pause_timer=pc_id in paused_by_share)
+        return session_id, len(targets)
+
+    def stop_screen_share(self) -> None:
+        self._log_event("SCREEN_SHARE_STOP_REQUESTED")
+        session_id = self.screen_share.active_session_id
+        self.screen_share.stop_session()
+        resumed_by_share = self._resume_session_timers_for_screen_share()
+        for pc_id in self.eligible_screen_share_targets():
+            self.send_command(pc_id, "SCREEN_SHARE_STOP", {"session_id": session_id, "resume_timer": pc_id in resumed_by_share})
 
     def shutdown_targets(self, targets: list[str]) -> list[str]:
         with self.lock:
@@ -1791,7 +1911,7 @@ class TeacherDeployServer:
             with self.lock:
                 for pc_id in targets:
                     c = self.clients.get(pc_id)
-                    if c and c.session_timer and c.session_timer.paused:
+                    if c and c.session_timer and c.session_timer.paused and not c.session_timer.screen_share_paused:
                         if c.session_timer.paused_at_ts is not None:
                             c.session_timer.paused_accum_ms += max(0, int((now - c.session_timer.paused_at_ts) * 1000))
                         c.session_timer.paused = False
@@ -1993,6 +2113,10 @@ class TeacherDeployUI:
         self.top_title_label.pack(side="left")
         self.settings_button = ctk.CTkButton(title_row, text="Settings", command=self._open_settings_modal, width=110, height=34, **BUTTON_NEUTRAL)
         self.settings_button.pack(side="right", padx=(8, 0))
+        self.screen_share_button = ctk.CTkButton(
+            title_row, text="Share Screen", command=self._toggle_screen_share, width=140, height=34, **BUTTON_PRIMARY
+        )
+        self.screen_share_button.pack(side="right", padx=(8, 0))
         self.reservations_button = ctk.CTkButton(
             title_row,
             text="Reservations",
@@ -2011,6 +2135,8 @@ class TeacherDeployUI:
             **BUTTON_NEUTRAL,
         )
         self.chat_btn.pack(side="right", padx=(8, 0), after=self.reservations_button)
+        self.chat_unread_badge = ctk.CTkLabel(self.chat_btn, text="", width=12, height=12, corner_radius=6, fg_color="#DC2626", text_color="#FFFFFF")
+        self.chat_unread_badge.place_forget()
         self.students_button = ctk.CTkButton(
             title_row,
             text="Students",
@@ -2297,6 +2423,29 @@ class TeacherDeployUI:
         self.server._log_event("ui_callback_error", detail=detail)
         self._set_runtime_notice("Dashboard recovered after a UI callback issue.", ESSU_WARNING, hold_s=20.0)
 
+    def _toggle_screen_share(self) -> None:
+        if self.server.screen_share.active_session_id:
+            self.server.stop_screen_share()
+            self._set_runtime_notice("Screen sharing stopped.", ESSU_WARNING, hold_s=8.0)
+        else:
+            _session_id, target_count = self.server.start_screen_share()
+            if target_count:
+                self._set_runtime_notice(f"Screen sharing started for {target_count} online student(s).", ESSU_PRIMARY, hold_s=8.0)
+            else:
+                self._set_runtime_notice("Screen sharing requires an online student.", ESSU_WARNING, hold_s=8.0)
+        self._refresh_screen_share_button()
+
+    def _refresh_screen_share_button(self) -> None:
+        active = bool(self.server.screen_share.active_session_id)
+        viewers = self.server.screen_share.viewer_count()
+        eligible = bool(self.server.eligible_screen_share_targets())
+        self._configure_if_changed(
+            self.screen_share_button,
+            text=(f"Stop Sharing ({viewers})" if active else "Share Screen"),
+            fg_color=(ESSU_ERROR if active else BUTTON_PRIMARY.get("fg_color")),
+            state="normal" if active or eligible else "disabled",
+        )
+
     def _on_close_requested(self) -> None:
         if messagebox.askyesno(
             "Exit Admin Dashboard",
@@ -2434,6 +2583,15 @@ class TeacherDeployUI:
     def _online_targets(self, targets: list[str]) -> list[str]:
         with self.server.lock:
             return [pc for pc in targets if (pc in self.server.clients and self.server.clients[pc].online)]
+
+    def _refresh_chat_unread_badge(self) -> None:
+        with self.server.lock:
+            unread = sum(int(conversation.get("unread", 0)) for conversation in self.server.conversations.values())
+        if unread:
+            self.chat_unread_badge.place(relx=0.82, rely=0.16)
+            self.chat_unread_badge.lift()
+        else:
+            self.chat_unread_badge.place_forget()
 
     def _refresh_control_buttons(self) -> None:
         targets = self._selected_targets()
@@ -3998,6 +4156,8 @@ class TeacherDeployUI:
                 self._update_sensor_panel(self.selected_pc)
 
             self._refresh_control_buttons()
+            self._refresh_chat_unread_badge()
+            self._refresh_screen_share_button()
         except Exception as exc:
             self.server._log_event("ui_drain_error", reason=str(exc))
             self._set_runtime_notice("Dashboard recovered after a refresh issue.", ESSU_WARNING, hold_s=20.0)
@@ -4008,7 +4168,12 @@ class TeacherDeployUI:
                 pass
 
     def run(self) -> None:
-        self.root.mainloop()
+        try:
+            self.root.mainloop()
+        finally:
+            # Stop through the server lifecycle so screen-share-only timer pauses are released.
+            self.server.stop_screen_share()
+            self.server.screen_share.shutdown()
 
 
 def main() -> None:
