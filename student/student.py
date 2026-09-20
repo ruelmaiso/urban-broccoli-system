@@ -35,7 +35,7 @@ ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT))
 
 from config.deploy_settings import NETWORK, RUNTIME
-from core.protocol import recv_json_line, send_frame, send_json
+from core.protocol import recv_frame, recv_json_line, send_frame, send_json
 from core.student_settings import StudentSettings, StudentSettingsStore, normalize_teacher_host
 
 STUDENT_LOG_DIR = ROOT / "logs"
@@ -62,6 +62,7 @@ class OverlayState(Enum):
     AUTH_REQUIRED = "auth_required"
     LOCKED_TEMPORARY = "locked_temporary"
     CONNECTING = "connecting"
+    SCREEN_SHARING = "screen_sharing"
 
 
 class OverlayController:
@@ -71,6 +72,12 @@ class OverlayController:
         self._lock_frame: Optional[ctk.CTkFrame] = None
         self._auth_frame: Optional[ctk.CTkFrame] = None
         self._connecting_frame: Optional[ctk.CTkFrame] = None
+        self._screen_share_frame: Optional[ctk.CTkFrame] = None
+        self._screen_share_image_label: Optional[ctk.CTkLabel] = None
+        self._screen_share_photo: Optional[ImageTk.PhotoImage] = None
+        self._latest_screen_frame: Optional[Image.Image] = None
+        self._screen_frame_lock = threading.Lock()
+        self._screen_share_session_id = ""
         self._state = OverlayState.HIDDEN
         self._cmd_q: "queue.Queue[tuple[str, dict, threading.Event, dict]]" = queue.Queue()
         self._worker_started = False
@@ -760,7 +767,51 @@ class OverlayController:
         self._cmd_q.put(("chat_add", {"direction": direction, "text": text, "ts": ts}, threading.Event(), {"ok": False}))
         return True
 
+    def _show_screen_share(self, session_id: str) -> None:
+        assert self._root is not None
+        for frame in (self._auth_frame, self._lock_frame, self._connecting_frame):
+            if frame is not None and frame.winfo_exists():
+                frame.place_forget()
+        self._screen_share_session_id = session_id
+        if self._screen_share_frame is None or not self._screen_share_frame.winfo_exists():
+            frame = ctk.CTkFrame(self._root, fg_color="#020617")
+            header = ctk.CTkLabel(frame, text="SCREEN SHARING  •  LIVE", font=("Arial", 16, "bold"), text_color="#86EFAC")
+            header.pack(anchor="w", padx=20, pady=(14, 4))
+            label = ctk.CTkLabel(frame, text="Waiting for Admin screen...", font=("Arial", 22, "bold"), text_color="#CBD5E1")
+            label.pack(fill="both", expand=True, padx=18, pady=(4, 18))
+            self._screen_share_frame = frame
+            self._screen_share_image_label = label
+        self._screen_share_frame.place(relx=0, rely=0, relwidth=1, relheight=1)
+        self._screen_share_frame.lift()
+
+    def _hide_screen_share(self) -> None:
+        if self._screen_share_frame is not None and self._screen_share_frame.winfo_exists():
+            self._screen_share_frame.place_forget()
+        with self._screen_frame_lock:
+            self._latest_screen_frame = None
+        self._screen_share_photo = None
+        self._screen_share_session_id = ""
+
+    def _refresh_screen_share_frame(self) -> None:
+        if self._state != OverlayState.SCREEN_SHARING or self._screen_share_image_label is None:
+            return
+        with self._screen_frame_lock:
+            image = self._latest_screen_frame
+            self._latest_screen_frame = None
+        if image is None:
+            return
+        try:
+            max_w = max(1, self._screen_share_image_label.winfo_width())
+            max_h = max(1, self._screen_share_image_label.winfo_height())
+            display = image.copy()
+            display.thumbnail((max_w, max_h), Image.Resampling.LANCZOS)
+            self._screen_share_photo = ImageTk.PhotoImage(display)
+            self._screen_share_image_label.configure(image=self._screen_share_photo, text="")
+        except Exception:
+            pass
+
     def _show_hidden(self) -> None:
+        self._hide_screen_share()
         if self._auth_frame is not None and self._auth_frame.winfo_exists():
             self._auth_frame.place_forget()
         if self._lock_frame is not None and self._lock_frame.winfo_exists():
@@ -785,6 +836,9 @@ class OverlayController:
             if self._chat_enabled:
                 self._root.after(50, lambda: self._set_chat_enabled_ui(True))
             return
+
+        elif state == OverlayState.SCREEN_SHARING:
+            self._show_screen_share(self._screen_share_session_id)
 
         elif state == OverlayState.LOCKED_TEMPORARY:
             self._show_lock()
@@ -941,6 +995,14 @@ class OverlayController:
                                     payload["send_register"],
                                 )
                                 result["ok"] = True
+                            elif cmd == "screen_share_start":
+                                self._screen_share_session_id = str(payload.get("session_id", ""))
+                                self._apply_state(OverlayState.SCREEN_SHARING)
+                                result["ok"] = True
+                            elif cmd == "screen_share_stop":
+                                self._hide_screen_share()
+                                self._apply_state(payload.get("restore_state", OverlayState.HIDDEN))
+                                result["ok"] = True
                             elif cmd == "toast":
                                 self._show_toast(payload.get("text", ""), int(payload.get("duration_ms", 4500)))
                                 result["ok"] = True
@@ -964,6 +1026,7 @@ class OverlayController:
                 finally:
                     if self._root is not None:
                         try:
+                            self._refresh_screen_share_frame()
                             self._root.after(50, pump_commands)
                         except Exception:
                             pass
@@ -1034,6 +1097,27 @@ class OverlayController:
         if not self._ui_ready_event.is_set():
             return False
         self._cmd_q.put(("toast", {"text": text, "duration_ms": int(duration_ms)}, threading.Event(), {"ok": False}))
+        return True
+
+    def start_screen_share_async(self, session_id: str) -> bool:
+        self._ensure_worker()
+        if not self._ui_ready_event.is_set():
+            return False
+        self._cmd_q.put(("screen_share_start", {"session_id": session_id}, threading.Event(), {"ok": False}))
+        return True
+
+    def show_screen_share_frame_async(self, image: Image.Image) -> bool:
+        """Replace, rather than queue, decoded frames so rendering stays real-time."""
+        if not self._ui_ready_event.is_set():
+            return False
+        with self._screen_frame_lock:
+            self._latest_screen_frame = image
+        return True
+
+    def stop_screen_share_async(self, restore_state: OverlayState) -> bool:
+        if not self._ui_ready_event.is_set():
+            return False
+        self._cmd_q.put(("screen_share_stop", {"restore_state": restore_state}, threading.Event(), {"ok": False}))
         return True
 
     def authenticate(self, send_login, send_register, timeout_s: float = 300.0) -> Optional[dict]:
@@ -1213,6 +1297,18 @@ class StudentDeployClient:
         self.udp_send_lock = threading.Lock()
         self._showing_connection_overlay = False
         self.logger = _student_logger()
+        self.screen_share_lock = threading.RLock()
+        self.screen_share_session_id = ""
+        self.screen_share_stop = threading.Event()
+        self.screen_share_video_port = NETWORK.screen_share_video_port
+        self.screen_share_audio_port = NETWORK.screen_share_audio_port
+        self.screen_share_audio_rate = RUNTIME.screen_share_audio_rate
+        self.screen_share_audio_channels = RUNTIME.screen_share_audio_channels
+        self.screen_share_audio_chunk_frames = RUNTIME.screen_share_audio_chunk_frames
+        self.screen_share_video_sock: Optional[socket.socket] = None
+        self.screen_share_audio_sock: Optional[socket.socket] = None
+        self.screen_share_audio_queue: "queue.Queue[bytes]" = queue.Queue(maxsize=8)
+        self.screen_share_timer_paused = False
 
     def get_teacher_ip(self) -> str:
         return self.teacher_ip
@@ -1418,6 +1514,161 @@ class StudentDeployClient:
             threading.Thread(target=self._run_power_command, args=(action,), daemon=True).start()
         return _runner
 
+    def _screen_share_restore_state(self) -> OverlayState:
+        snapshot = self._state_snapshot()
+        if snapshot["signout_lock_active"] or not snapshot["current_user"]:
+            return OverlayState.AUTH_REQUIRED
+        if snapshot["temporary_lock_active"]:
+            return OverlayState.LOCKED_TEMPORARY
+        return OverlayState.HIDDEN
+
+    def _close_screen_share_sockets(self) -> None:
+        with self.screen_share_lock:
+            sockets = (self.screen_share_video_sock, self.screen_share_audio_sock)
+            self.screen_share_video_sock = None
+            self.screen_share_audio_sock = None
+        for sock in sockets:
+            if sock:
+                try: sock.shutdown(socket.SHUT_RDWR)
+                except OSError: pass
+                try: sock.close()
+                except OSError: pass
+
+    def _start_screen_share(self, msg: dict) -> tuple[bool, str]:
+        session_id = str(msg.get("session_id", "")).strip()
+        if not session_id or not self.pc_id:
+            return False, "invalid_screen_share_session"
+        self._stop_screen_share(show_ui=False)
+        if bool(msg.get("pause_timer", False)):
+            # The teacher marks this flag only when screen sharing owns the session pause.
+            self.screen_share_timer_paused = True
+            self.timer_manager.pause_timer(self.session_timer_id)
+        with self.screen_share_lock:
+            self.screen_share_session_id = session_id
+            self.screen_share_video_port = int(msg.get("video_port", NETWORK.screen_share_video_port))
+            self.screen_share_audio_port = int(msg.get("audio_port", NETWORK.screen_share_audio_port))
+            self.screen_share_audio_rate = int(msg.get("audio_rate", RUNTIME.screen_share_audio_rate))
+            self.screen_share_audio_channels = int(msg.get("audio_channels", RUNTIME.screen_share_audio_channels))
+            self.screen_share_audio_chunk_frames = int(msg.get("audio_chunk_frames", RUNTIME.screen_share_audio_chunk_frames))
+            self.screen_share_stop = threading.Event()
+            stop = self.screen_share_stop
+        self.overlay.start_screen_share_async(session_id)
+        threading.Thread(target=self._screen_share_video_loop, args=(session_id, stop), daemon=True).start()
+        threading.Thread(target=self._screen_share_audio_receive_loop, args=(session_id, stop), daemon=True).start()
+        threading.Thread(target=self._screen_share_audio_playback_loop, args=(session_id, stop), daemon=True).start()
+        self.logger.info(json.dumps({"event": "screen_share_started", "session_id": session_id}))
+        return True, ""
+
+    def _stop_screen_share(self, *, show_ui: bool = True, resume_timer: bool = False) -> None:
+        with self.screen_share_lock:
+            active = self.screen_share_session_id
+            self.screen_share_session_id = ""
+            self.screen_share_stop.set()
+        self._close_screen_share_sockets()
+        if resume_timer and self.screen_share_timer_paused:
+            self.timer_manager.resume_timer(self.session_timer_id)
+        self.screen_share_timer_paused = False
+        while not self.screen_share_audio_queue.empty():
+            try: self.screen_share_audio_queue.get_nowait()
+            except queue.Empty: break
+        if show_ui:
+            self.overlay.stop_screen_share_async(self._screen_share_restore_state())
+        if active:
+            self.logger.info(json.dumps({"event": "screen_share_stopped", "session_id": active}))
+
+    def _screen_share_current(self, session_id: str, stop: threading.Event) -> bool:
+        with self.screen_share_lock:
+            return not stop.is_set() and self.screen_share_session_id == session_id
+
+    def _connect_screen_share_socket(self, media: str, session_id: str) -> Optional[socket.socket]:
+        with self.screen_share_lock:
+            port = self.screen_share_video_port if media == "video" else self.screen_share_audio_port
+        sock: Optional[socket.socket] = None
+        try:
+            sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+            sock.settimeout(5.0)
+            sock.connect((self.teacher_ip, port))
+            send_json(sock, {"type": f"screen_share_{media}_register", "pc_id": self.pc_id, "session_id": session_id})
+            sock.settimeout(None)
+            with self.screen_share_lock:
+                if media == "video": self.screen_share_video_sock = sock
+                else: self.screen_share_audio_sock = sock
+            return sock
+        except OSError:
+            if sock is not None:
+                try: sock.close()
+                except OSError: pass
+            return None
+
+    def _screen_share_video_loop(self, session_id: str, stop: threading.Event) -> None:
+        while self._screen_share_current(session_id, stop):
+            sock = self._connect_screen_share_socket("video", session_id)
+            if sock is None:
+                time.sleep(1)
+                continue
+            try:
+                while self._screen_share_current(session_id, stop):
+                    payload = recv_frame(sock)
+                    if payload is None: break
+                    array = numpy.frombuffer(payload, dtype=numpy.uint8)
+                    decoded = cv2.imdecode(array, cv2.IMREAD_COLOR)
+                    if decoded is not None:
+                        image = Image.fromarray(cv2.cvtColor(decoded, cv2.COLOR_BGR2RGB))
+                        self.overlay.show_screen_share_frame_async(image)
+            except (OSError, ValueError):
+                pass
+            finally:
+                try: sock.close()
+                except OSError: pass
+                with self.screen_share_lock:
+                    if self.screen_share_video_sock is sock: self.screen_share_video_sock = None
+
+    def _screen_share_audio_receive_loop(self, session_id: str, stop: threading.Event) -> None:
+        while self._screen_share_current(session_id, stop):
+            sock = self._connect_screen_share_socket("audio", session_id)
+            if sock is None:
+                time.sleep(1)
+                continue
+            try:
+                while self._screen_share_current(session_id, stop):
+                    payload = recv_frame(sock)
+                    if payload is None: break
+                    try: self.screen_share_audio_queue.put_nowait(payload)
+                    except queue.Full:
+                        try: self.screen_share_audio_queue.get_nowait()
+                        except queue.Empty: pass
+                        try: self.screen_share_audio_queue.put_nowait(payload)
+                        except queue.Full: pass
+            except OSError:
+                pass
+            finally:
+                try: sock.close()
+                except OSError: pass
+                with self.screen_share_lock:
+                    if self.screen_share_audio_sock is sock: self.screen_share_audio_sock = None
+
+    def _screen_share_audio_playback_loop(self, session_id: str, stop: threading.Event) -> None:
+        audio = stream = None
+        try:
+            import pyaudiowpatch as pyaudio
+            audio = pyaudio.PyAudio()
+            with self.screen_share_lock:
+                rate, channels, chunk = self.screen_share_audio_rate, self.screen_share_audio_channels, self.screen_share_audio_chunk_frames
+            stream = audio.open(format=pyaudio.paInt16, channels=channels, rate=rate, output=True, frames_per_buffer=chunk)
+            while self._screen_share_current(session_id, stop):
+                try: payload = self.screen_share_audio_queue.get(timeout=0.25)
+                except queue.Empty: continue
+                stream.write(payload)
+        except Exception as exc:
+            self.logger.info(json.dumps({"event": "screen_share_audio_playback_failed", "session_id": session_id, "reason": str(exc)}))
+        finally:
+            if stream:
+                try: stream.stop_stream(); stream.close()
+                except Exception: pass
+            if audio:
+                try: audio.terminate()
+                except Exception: pass
+
     def _execute_command(self, msg: dict, *, from_udp: bool = False):
         command = msg.get("command")
         cmd_id = str(msg.get("cmd_id", "")).strip()
@@ -1510,8 +1761,9 @@ class StudentDeployClient:
                 if self.enable_timer_pause_on_temp_lock:
                     timer_id = str(msg.get("timer_id", ""))
                     resume_ts = msg.get("resume_ts")
-                    self.timer_manager.resume_timer(timer_id, resume_ts)
                     if timer_id != self.session_timer_id:
+                        self.timer_manager.resume_timer(timer_id, resume_ts)
+                    if not self.screen_share_timer_paused:
                         self.timer_manager.resume_timer(self.session_timer_id, resume_ts)
             except Exception:
                 applied = False
@@ -1553,6 +1805,19 @@ class StudentDeployClient:
             except Exception:
                 applied = False
                 reason = "extension_offer_failed"
+        elif command == "SCREEN_SHARE_START":
+            if from_udp:
+                applied, reason = False, "tcp_required"
+            else:
+                applied, reason = self._start_screen_share(msg)
+        elif command == "SCREEN_SHARE_STOP":
+            requested_session = str(msg.get("session_id", "")).strip()
+            with self.screen_share_lock:
+                current_session = self.screen_share_session_id
+            if requested_session and current_session and requested_session != current_session:
+                reason = "stale_screen_share_stop_ignored"
+            else:
+                self._stop_screen_share(resume_timer=bool(msg.get("resume_timer", False)))
         elif command == "SHUTDOWN":
             if from_udp:
                 applied = False
@@ -1944,6 +2209,7 @@ class StudentDeployClient:
             while True:
                 time.sleep(1)
         except KeyboardInterrupt:
+            self._stop_screen_share()
             self._cleanup_sockets()
             self.overlay.set_state(OverlayState.HIDDEN)
 
