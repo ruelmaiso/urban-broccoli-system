@@ -20,10 +20,6 @@ import numpy
 import os
 import platform
 import psutil
-try:
-    import sounddevice as sd
-except Exception:
-    sd = None
 from PIL import Image, ImageTk
 import sys
 
@@ -39,7 +35,7 @@ ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT))
 
 from config.deploy_settings import NETWORK, RUNTIME
-from core.protocol import recv_frame, recv_json_line, send_frame, send_json
+from core.protocol import recv_json_line, send_frame, send_json
 from core.student_settings import StudentSettings, StudentSettingsStore, normalize_teacher_host
 
 STUDENT_LOG_DIR = ROOT / "logs"
@@ -57,12 +53,6 @@ def _student_logger() -> logging.Logger:
     logger.propagate = False
     return logger
 
-AUDIO_SAMPLE_RATE = 16000
-AUDIO_CHANNELS = 1
-AUDIO_DTYPE = "int16"
-AUDIO_BLOCK_MS = 40
-AUDIO_BLOCK_SIZE = max(1, int(AUDIO_SAMPLE_RATE * AUDIO_BLOCK_MS / 1000))
-
 
 DEV_MODE = True
 
@@ -72,7 +62,6 @@ class OverlayState(Enum):
     AUTH_REQUIRED = "auth_required"
     LOCKED_TEMPORARY = "locked_temporary"
     CONNECTING = "connecting"
-    BROADCAST = "broadcast"
 
 
 class OverlayController:
@@ -82,10 +71,6 @@ class OverlayController:
         self._lock_frame: Optional[ctk.CTkFrame] = None
         self._auth_frame: Optional[ctk.CTkFrame] = None
         self._connecting_frame: Optional[ctk.CTkFrame] = None
-        self._broadcast_frame: Optional[ctk.CTkFrame] = None
-        self._broadcast_image_label: Optional[ctk.CTkLabel] = None
-        self._broadcast_status_label: Optional[ctk.CTkLabel] = None
-        self._broadcast_photo: Optional[ImageTk.PhotoImage] = None
         self._state = OverlayState.HIDDEN
         self._cmd_q: "queue.Queue[tuple[str, dict, threading.Event, dict]]" = queue.Queue()
         self._worker_started = False
@@ -114,7 +99,6 @@ class OverlayController:
         self._chat_launcher_pos: Optional[tuple[int, int]] = None
         self._chat_launcher_drag_state: Optional[dict] = None
         self._chat_launcher_suppress_click_until = 0.0
-        self._broadcast_diag_callback: Optional[Callable[[str, dict], None]] = None
 
         logo_path = resource_path("assets/essu_logo.png")
         try:
@@ -132,13 +116,6 @@ class OverlayController:
             self._ui_ready_event.clear()
             self._worker_thread = threading.Thread(target=self._ui_loop, daemon=True)
             self._worker_thread.start()
-
-    def set_broadcast_diag_callback(self, callback: Callable[[str, dict], None]) -> None:
-        self._broadcast_diag_callback = callback
-
-    def _emit_broadcast_diag(self, event: str, **data) -> None:
-        if self._broadcast_diag_callback is not None:
-            self._broadcast_diag_callback(event, data)
 
     def _build_connecting_frame(self) -> ctk.CTkFrame:
         assert self._root is not None
@@ -230,81 +207,6 @@ class OverlayController:
 
         return frame
 
-    def _build_broadcast_frame(self) -> ctk.CTkFrame:
-        assert self._root is not None
-        frame = ctk.CTkFrame(self._root, fg_color="#020617")
-        frame.place(relx=0, rely=0, relwidth=1, relheight=1)
-
-        self._broadcast_image_label = ctk.CTkLabel(
-            frame,
-            text="Screen share is starting...",
-            text_color="#E2E8F0",
-            font=("Arial", 24, "bold"),
-            fg_color="transparent",
-            anchor="center",
-            justify="center",
-        )
-        self._broadcast_image_label.pack(fill="both", expand=True, padx=18, pady=(18, 8))
-
-        self._broadcast_status_label = ctk.CTkLabel(
-            frame,
-            text="Admin Screen Share",
-            text_color="#94A3B8",
-            font=("Arial", 13),
-            fg_color="transparent",
-        )
-        self._broadcast_status_label.pack(pady=(0, 18))
-        return frame
-
-    def _clear_broadcast_ui(self) -> None:
-        if self._broadcast_image_label is not None and self._broadcast_image_label.winfo_exists():
-            self._broadcast_image_label.configure(
-                image=None,
-                text="Admin screen share is starting...",
-                compound="center",
-            )
-            self._broadcast_image_label.image = None
-        self._broadcast_photo = None
-
-    def _hide_broadcast(self) -> None:
-        if self._broadcast_frame is not None and self._broadcast_frame.winfo_exists():
-            self._broadcast_frame.place_forget()
-
-    def _show_broadcast(self) -> None:
-        assert self._root is not None
-        if self._auth_frame is not None and self._auth_frame.winfo_exists():
-            self._auth_frame.place_forget()
-        if self._lock_frame is not None and self._lock_frame.winfo_exists():
-            self._lock_frame.place_forget()
-        if self._connecting_frame is not None and self._connecting_frame.winfo_exists():
-            self._connecting_frame.place_forget()
-        if self._broadcast_frame is None or not self._broadcast_frame.winfo_exists():
-            self._broadcast_frame = self._build_broadcast_frame()
-        else:
-            self._broadcast_frame.place(relx=0, rely=0, relwidth=1, relheight=1)
-        self._broadcast_frame.lift()
-
-    def _render_broadcast_frame(self, image: Optional[Image.Image]) -> None:
-        assert self._root is not None
-        if image is None:
-            self._clear_broadcast_ui()
-            return
-        self._emit_broadcast_diag("ui_render_enter")
-        if self._broadcast_frame is None or not self._broadcast_frame.winfo_exists():
-            self._broadcast_frame = self._build_broadcast_frame()
-        if self._broadcast_image_label is None or not self._broadcast_image_label.winfo_exists():
-            return
-        display = image.copy()
-        screen_w = max(1, int(self._root.winfo_screenwidth()))
-        screen_h = max(1, int(self._root.winfo_screenheight()))
-        display.thumbnail((screen_w, screen_h))
-        self._broadcast_photo = ImageTk.PhotoImage(display)
-        self._broadcast_image_label.configure(image=self._broadcast_photo, text="", compound="center")
-        self._broadcast_image_label.image = self._broadcast_photo
-        self._emit_broadcast_diag("ui_rendered")
-        if self._broadcast_status_label is not None and self._broadcast_status_label.winfo_exists():
-            self._broadcast_status_label.configure(text="Live")
-
     def _build_lock_frame(self) -> ctk.CTkFrame:
         assert self._root is not None
 
@@ -349,7 +251,6 @@ class OverlayController:
             self._auth_frame.place_forget()
         if self._connecting_frame is not None and self._connecting_frame.winfo_exists():
             self._connecting_frame.place_forget()
-        self._hide_broadcast()
 
         if self._lock_frame is None or not self._lock_frame.winfo_exists():
             self._lock_frame = self._build_lock_frame()
@@ -367,7 +268,6 @@ class OverlayController:
             self._auth_frame.place_forget()
         if self._lock_frame is not None and self._lock_frame.winfo_exists():
             self._lock_frame.place_forget()
-        self._hide_broadcast()
 
         if self._connecting_frame is None or not self._connecting_frame.winfo_exists():
             self._connecting_frame = self._build_connecting_frame()
@@ -380,7 +280,6 @@ class OverlayController:
             self._lock_frame.place_forget()
         if self._connecting_frame is not None and self._connecting_frame.winfo_exists():
             self._connecting_frame.place_forget()
-        self._hide_broadcast()
         if self._auth_frame is not None and self._auth_frame.winfo_exists():
             self._auth_frame.destroy()
 
@@ -868,7 +767,6 @@ class OverlayController:
             self._lock_frame.place_forget()
         if self._connecting_frame is not None and self._connecting_frame.winfo_exists():
             self._connecting_frame.place_forget()
-        self._hide_broadcast()
 
     def _apply_state(self, state: OverlayState, send_login=None, send_register=None) -> None:
         assert self._root is not None
@@ -909,8 +807,6 @@ class OverlayController:
                 send_login, send_register = _bootstrap_noop_login, _bootstrap_noop_register
             self._show_auth(send_login, send_register)
 
-        elif state == OverlayState.BROADCAST:
-            self._show_broadcast()
 
         # HIDDEN FIX + FULLSCREEN FIX
         self._root.deiconify()
@@ -1055,13 +951,6 @@ class OverlayController:
                             elif cmd == "chat_visibility":
                                 self._set_chat_enabled_ui(bool(payload.get("enabled", False)))
                                 result["ok"] = True
-                            elif cmd == "broadcast_frame":
-                                self._emit_broadcast_diag("ui_frame_dequeued", queue_size=self._cmd_q.qsize())
-                                self._render_broadcast_frame(payload.get("image"))
-                                result["ok"] = True
-                            elif cmd == "broadcast_clear":
-                                self._clear_broadcast_ui()
-                                result["ok"] = True
                             else:
                                 result["ok"] = False
                         except Exception:
@@ -1087,10 +976,6 @@ class OverlayController:
             self._lock_frame = None
             self._auth_frame = None
             self._connecting_frame = None
-            self._broadcast_frame = None
-            self._broadcast_image_label = None
-            self._broadcast_status_label = None
-            self._broadcast_photo = None
             self._toast_label = None
             self._chat_window = None
             self._chat_scroll = None
@@ -1166,20 +1051,6 @@ class OverlayController:
             return self._auth_result_q.get(timeout=timeout_s)
         except queue.Empty:
             return None
-
-    def show_broadcast_frame_async(self, image: Image.Image) -> bool:
-        self._ensure_worker()
-        if not self._ui_ready_event.is_set():
-            return False
-        self._cmd_q.put(("broadcast_frame", {"image": image}, threading.Event(), {"ok": False}))
-        return True
-
-    def clear_broadcast_frame_async(self) -> bool:
-        self._ensure_worker()
-        if not self._ui_ready_event.is_set():
-            return False
-        self._cmd_q.put(("broadcast_clear", {}, threading.Event(), {"ok": False}))
-        return True
 
 
 class TimerManager:
@@ -1301,7 +1172,6 @@ class StudentDeployClient:
         self.pc_id: Optional[str] = None
 
         self.overlay = OverlayController()
-        self.overlay.set_broadcast_diag_callback(self._on_overlay_broadcast_diag)
         self.overlay.set_chat_sender(self.send_session_message)
         self.overlay.set_teacher_host_settings(self.get_teacher_ip, self.save_teacher_ip)
         self.overlay.set_chat_timer_provider(self._chat_remaining_s)
@@ -1314,8 +1184,6 @@ class StudentDeployClient:
 
         self.control_sock: Optional[socket.socket] = None
         self.video_sock: Optional[socket.socket] = None
-        self.broadcast_sock: Optional[socket.socket] = None
-        self.broadcast_audio_sock: Optional[socket.socket] = None
         self.control_file = None
         self.send_lock = threading.Lock()
         self.conn_lock = threading.Lock()
@@ -1344,60 +1212,7 @@ class StudentDeployClient:
         self.udp_send_sock: Optional[socket.socket] = None
         self.udp_send_lock = threading.Lock()
         self._showing_connection_overlay = False
-        self.broadcast_active = False
-        self._broadcast_audio_missing_warned = False
-        self._broadcast_audio_device_warned = False
         self.logger = _student_logger()
-        self.broadcast_diag_counters = {
-            "frames_received": 0,
-            "frames_decoded": 0,
-            "frames_enqueued": 0,
-            "frames_dequeued": 0,
-            "frames_rendered": 0,
-        }
-        self.broadcast_diag_first_frame_mono: Optional[float] = None
-        self.broadcast_diag_last_render_mono: Optional[float] = None
-        self.broadcast_diag_session = 0
-
-    def _broadcast_diag(self, event: str, **data: object) -> None:
-        with self.state_lock:
-            active = bool(self.broadcast_active)
-            connected = bool(self.connected)
-            connecting = bool(self.connecting)
-        with self.conn_lock:
-            broadcast_sock = self.broadcast_sock
-            control_sock = self.control_sock
-        payload = {
-            "ts": round(time.time(), 3),
-            "mono_ts": round(time.monotonic(), 6),
-            "event": "broadcast_diag",
-            "diag_event": event,
-            "side": "STUDENT",
-            "thread_name": threading.current_thread().name,
-            "thread_ident": threading.get_ident(),
-            "pc_id": self.pc_id,
-            "broadcast_diag_session": self.broadcast_diag_session,
-            "broadcast_active": active,
-            "connected": connected,
-            "connecting": connecting,
-            "broadcast_sock_id": id(broadcast_sock) if broadcast_sock else None,
-            "control_sock_id": id(control_sock) if control_sock else None,
-            "counters": dict(self.broadcast_diag_counters),
-            **data,
-        }
-        self.logger.info(json.dumps(payload, sort_keys=True))
-
-    def _on_overlay_broadcast_diag(self, event: str, data: dict) -> None:
-        should_log = False
-        if event == "ui_frame_dequeued":
-            self.broadcast_diag_counters["frames_dequeued"] += 1
-            should_log = self.broadcast_diag_counters["frames_dequeued"] == 1 or self.broadcast_diag_counters["frames_dequeued"] % 100 == 0
-        elif event == "ui_rendered":
-            self.broadcast_diag_counters["frames_rendered"] += 1
-            self.broadcast_diag_last_render_mono = time.monotonic()
-            should_log = self.broadcast_diag_counters["frames_rendered"] == 1 or self.broadcast_diag_counters["frames_rendered"] % 100 == 0
-        if should_log:
-            self._broadcast_diag(event, queue_size=data.get("queue_size"), last_render_mono=self.broadcast_diag_last_render_mono)
 
     def get_teacher_ip(self) -> str:
         return self.teacher_ip
@@ -1433,7 +1248,6 @@ class StudentDeployClient:
                 "current_user": self.current_user,
                 "signout_lock_active": bool(self.signout_lock_active),
                 "temporary_lock_active": bool(self.temporary_lock_active),
-                "broadcast_active": bool(self.broadcast_active),
             }
 
     def _update_state(self, **changes) -> None:
@@ -1522,8 +1336,6 @@ class StudentDeployClient:
         self._showing_connection_overlay = False
         chat_enabled = bool(self.enable_session_messaging and snapshot["current_user"] and (not snapshot["signout_lock_active"]))
         self.overlay.set_chat_enabled(chat_enabled)
-        if snapshot["broadcast_active"]:
-            return self.overlay.set_state(OverlayState.BROADCAST)
         if snapshot["signout_lock_active"] or not snapshot["current_user"]:
             return self.overlay.set_state(OverlayState.AUTH_REQUIRED)
         if snapshot["temporary_lock_active"]:
@@ -1575,19 +1387,12 @@ class StudentDeployClient:
                 return False
 
     def _send_ack(self, ack: dict) -> None:
-        is_broadcast_ack = ack.get("command") in {"BROADCAST_START", "BROADCAST_STOP"}
-        if is_broadcast_ack:
-            self._broadcast_diag("command_ack_attempt", command=ack.get("command"), cmd_id=ack.get("cmd_id"), result=ack.get("result"), reason=ack.get("reason", ""), note="ack_does_not_prove_downlink_registration")
         with self.conn_lock:
             control_sock = self.control_sock
         if control_sock and self.pc_id:
             if self._safe_send_json(control_sock, ack):
-                if is_broadcast_ack:
-                    self._broadcast_diag("command_ack_sent", command=ack.get("command"), cmd_id=ack.get("cmd_id"), transport="tcp")
                 return
         self._send_udp_json(ack)
-        if is_broadcast_ack:
-            self._broadcast_diag("command_ack_sent", command=ack.get("command"), cmd_id=ack.get("cmd_id"), transport="udp_fallback")
 
     def _make_ack(self, command: object, cmd_id: str, applied: bool, reason: str = "") -> dict:
         return {
@@ -1598,28 +1403,6 @@ class StudentDeployClient:
             "result": "applied" if applied else "failed",
             "reason": reason,
         }
-
-    def _start_broadcast_session(self) -> bool:
-        self.broadcast_diag_session += 1
-        self.broadcast_diag_first_frame_mono = None
-        self._broadcast_diag("student_start_session_enter")
-        self._update_state(broadcast_active=True)
-        self.overlay.clear_broadcast_frame_async()
-        applied = self.overlay.set_state(OverlayState.BROADCAST)
-        if not applied:
-            self._update_state(broadcast_active=False)
-        self._broadcast_diag("student_start_session_complete", overlay_applied=applied)
-        return applied
-
-    def _stop_broadcast_session(self) -> bool:
-        self._broadcast_diag("student_stop_session_enter")
-        self._update_state(broadcast_active=False)
-        self._close_broadcast_socket()
-        self._close_broadcast_audio_socket()
-        self.overlay.clear_broadcast_frame_async()
-        applied = self._restore_overlay_state()
-        self._broadcast_diag("student_stop_session_complete", overlay_applied=applied)
-        return applied
 
     def _run_power_command(self, action: str) -> None:
         system_name = platform.system().strip().lower()
@@ -1638,8 +1421,6 @@ class StudentDeployClient:
     def _execute_command(self, msg: dict, *, from_udp: bool = False):
         command = msg.get("command")
         cmd_id = str(msg.get("cmd_id", "")).strip()
-        if command in {"BROADCAST_START", "BROADCAST_STOP"}:
-            self._broadcast_diag("command_received", command=command, cmd_id=cmd_id, transport="udp" if from_udp else "tcp")
         if self._is_duplicate_command(cmd_id):
             return self._make_ack(command, cmd_id, True, "duplicate_ignored"), None
         applied = True
@@ -1772,22 +1553,6 @@ class StudentDeployClient:
             except Exception:
                 applied = False
                 reason = "extension_offer_failed"
-        elif command == "BROADCAST_START":
-            try:
-                applied = self._start_broadcast_session()
-                if not applied:
-                    reason = "broadcast_start_failed"
-            except Exception:
-                applied = False
-                reason = "broadcast_start_failed"
-        elif command == "BROADCAST_STOP":
-            try:
-                applied = self._stop_broadcast_session()
-                if not applied:
-                    reason = "broadcast_stop_failed"
-            except Exception:
-                applied = False
-                reason = "broadcast_stop_failed"
         elif command == "SHUTDOWN":
             if from_udp:
                 applied = False
@@ -1810,8 +1575,6 @@ class StudentDeployClient:
             applied = False
             reason = "unsupported_command"
         ack = self._make_ack(command, cmd_id, applied, reason)
-        if command in {"BROADCAST_START", "BROADCAST_STOP"}:
-            self._broadcast_diag("command_executed", command=command, cmd_id=cmd_id, applied=applied, reason=reason, note="start_ack_does_not_prove_downlink_registration")
         return ack, post_action
 
     def _udp_fallback_loop(self) -> None:
@@ -1942,145 +1705,25 @@ class StudentDeployClient:
         except OSError:
             return False
 
-    def _connect_broadcast_video(self) -> bool:
-        if not self.pc_id:
-            self._broadcast_diag("receiver_connect_skipped_no_pc_id")
-            return False
-        self._broadcast_diag("receiver_connect_enter", receiver_state="CONNECTING")
-        try:
-            sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-            sock.connect((self.teacher_ip, NETWORK.video_port))
-            send_json(sock, {"type": "video_register", "pc_id": self.pc_id, "role": "broadcast_downlink"})
-            self._broadcast_diag("receiver_registration_sent", receiver_state="REGISTERED", local_socket_id=id(sock))
-            with self.conn_lock:
-                existing = self.broadcast_sock
-                self.broadcast_sock = sock
-            if existing is not None and existing is not sock:
-                try:
-                    existing.close()
-                except OSError:
-                    pass
-            return True
-        except OSError as exc:
-            self._broadcast_diag("receiver_connect_failed", receiver_state="RETRYING", reason=str(exc))
-            return False
-
-    def _connect_broadcast_audio(self) -> bool:
-        if not self.pc_id:
-            return False
-        try:
-            sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-            sock.connect((self.teacher_ip, NETWORK.video_port))
-            send_json(sock, {"type": "video_register", "pc_id": self.pc_id, "role": "broadcast_audio_downlink"})
-            with self.conn_lock:
-                existing = self.broadcast_audio_sock
-                self.broadcast_audio_sock = sock
-            if existing is not None and existing is not sock:
-                try:
-                    existing.close()
-                except OSError:
-                    pass
-            return True
-        except OSError:
-            return False
-
-    # def _close_broadcast_socket(self) -> None:
-    #     with self.conn_lock:
-    #         sock = self.broadcast_sock
-    #         self.broadcast_sock = None
-    #     if sock is not None:
-    #         try:
-    #             sock.close()
-    #         except OSError:
-    #             pass
-    def _close_broadcast_socket(self, expected_sock: Optional[socket.socket] = None) -> None:
-        """Close the video socket only if it is still the caller's socket.
-
-        The receiver keeps a local socket while recv_frame() blocks.  Stop can
-        replace that socket before the old recv wakes up, so old receive cleanup
-        must never close the replacement.
-        """
-        with self.conn_lock:
-            sock = self.broadcast_sock
-            if expected_sock is not None and sock is not expected_sock:
-                stale = True
-            else:
-                stale = False
-                self.broadcast_sock = None
-
-        if stale:
-            self._broadcast_diag(
-                "receiver_socket_close_skipped_stale",
-                local_socket_id=id(expected_sock),
-                current_socket_id=id(sock) if sock else None,
-            )
-            return
-
-        self._broadcast_diag("receiver_socket_close_begin", local_socket_id=id(sock) if sock else None)
-
-        if sock is not None:
-            try:
-                sock.shutdown(socket.SHUT_RDWR)
-            except OSError:
-                pass
-
-            try:
-                sock.close()
-            except OSError:
-                pass
-        self._broadcast_diag("receiver_socket_close_complete", local_socket_id=id(sock) if sock else None)
-
-    # def _close_broadcast_audio_socket(self) -> None:
-    #     with self.conn_lock:
-    #         sock = self.broadcast_audio_sock
-    #         self.broadcast_audio_sock = None
-    #     if sock is not None:
-    #         try:
-    #             sock.close()
-    #         except OSError:
-    #             pass
-    def _close_broadcast_audio_socket(self) -> None:
-        with self.conn_lock:
-            sock = self.broadcast_audio_sock
-            self.broadcast_audio_sock = None
-
-        if sock is not None:
-            try:
-                sock.shutdown(socket.SHUT_RDWR)
-            except OSError:
-                pass
-
-            try:
-                sock.close()
-            except OSError:
-                pass
-
     def _cleanup_sockets(self) -> None:
-        self._broadcast_diag("cleanup_sockets_begin")
         with self.conn_lock:
             control_sock = self.control_sock
             video_sock = self.video_sock
-            broadcast_sock = self.broadcast_sock
-            broadcast_audio_sock = self.broadcast_audio_sock
             control_file = self.control_file
             self.control_sock = None
             self.video_sock = None
-            self.broadcast_sock = None
-            self.broadcast_audio_sock = None
             self.control_file = None
-        self._update_state(broadcast_active=False)
         if control_file is not None:
             try:
                 control_file.close()
             except OSError:
                 pass
-        for sock in (control_sock, video_sock, broadcast_sock, broadcast_audio_sock):
+        for sock in (control_sock, video_sock):
             if sock:
                 try:
                     sock.close()
                 except OSError:
                     pass
-        self._broadcast_diag("cleanup_sockets_complete", closed_broadcast_socket_id=id(broadcast_sock) if broadcast_sock else None)
 
     def _reconnect_loop(self) -> None:
         while True:
@@ -2183,8 +1826,6 @@ class StudentDeployClient:
                     continue
                 if msg_type != "command":
                     continue
-                if msg.get("command") in {"BROADCAST_START", "BROADCAST_STOP"}:
-                    self._broadcast_diag("control_command_dispatch", command=msg.get("command"), cmd_id=msg.get("cmd_id"))
                 ack, post_action = self._execute_command(msg, from_udp=False)
                 self._send_ack(ack)
                 if post_action is not None:
@@ -2226,133 +1867,6 @@ class StudentDeployClient:
                 self._update_state(connected=False)
                 self._cleanup_sockets()
                 time.sleep(0.2)
-
-    def _broadcast_receiver_loop(self) -> None:
-        self._broadcast_diag("receiver_worker_started", receiver_state="IDLE")
-        last_idle = None
-        while True:
-            sock: Optional[socket.socket] = None
-            try:
-                snapshot = self._state_snapshot()
-                if not snapshot["broadcast_active"]:
-                    if last_idle != snapshot["broadcast_active"]:
-                        self._broadcast_diag("receiver_idle", receiver_state="IDLE")
-                        last_idle = snapshot["broadcast_active"]
-                    time.sleep(0.2)
-                    continue
-
-                last_idle = snapshot["broadcast_active"]
-
-                with self.conn_lock:
-                    sock = self.broadcast_sock
-                if sock is None:
-                    if (not snapshot["connected"]) or (not self.pc_id):
-                        time.sleep(0.2)
-                        continue
-                    if not self._connect_broadcast_video():
-                        time.sleep(1)
-                    continue
-
-                recv_started = time.monotonic()
-                recv_count_before = self.broadcast_diag_counters["frames_received"]
-                log_recv_boundary = recv_count_before == 0 or (recv_count_before + 1) % 100 == 0
-                if log_recv_boundary:
-                    self._broadcast_diag("receiver_recv_enter", receiver_state="WAITING_FOR_FRAME", local_socket_id=id(sock), field_matches_local=(self.broadcast_sock is sock))
-                frame_data = recv_frame(sock)
-                recv_duration = round(time.monotonic() - recv_started, 6)
-                if frame_data is None or log_recv_boundary:
-                    self._broadcast_diag("receiver_recv_return", receiver_state="EOF" if frame_data is None else "FRAME_RECEIVED", local_socket_id=id(sock), field_matches_local=(self.broadcast_sock is sock), recv_duration_s=recv_duration, frame_size=len(frame_data) if frame_data else None)
-                if frame_data is None:
-                    self._close_broadcast_socket(sock)
-                    time.sleep(0.2)
-                    continue
-                self.broadcast_diag_counters["frames_received"] += 1
-                if self.broadcast_diag_first_frame_mono is None:
-                    self.broadcast_diag_first_frame_mono = time.monotonic()
-                    self._broadcast_diag("receiver_first_frame_received", receiver_state="FRAME_RECEIVED")
-                np_buf = numpy.frombuffer(frame_data, dtype=numpy.uint8)
-                frame = cv2.imdecode(np_buf, cv2.IMREAD_COLOR)
-                if frame is None:
-                    self._broadcast_diag("receiver_decode_failed", receiver_state="FRAME_RECEIVED")
-                    continue
-                self.broadcast_diag_counters["frames_decoded"] += 1
-                if self.broadcast_diag_counters["frames_decoded"] == 1:
-                    self._broadcast_diag("receiver_first_frame_decoded", receiver_state="FRAME_RECEIVED")
-                rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
-                queued = self.overlay.show_broadcast_frame_async(Image.fromarray(rgb))
-                if queued:
-                    self.broadcast_diag_counters["frames_enqueued"] += 1
-                if self.broadcast_diag_counters["frames_enqueued"] == 1:
-                    self._broadcast_diag("receiver_first_frame_enqueued", receiver_state="FRAME_RECEIVED", queued=queued)
-            except OSError as exc:
-                self._broadcast_diag("receiver_socket_error", receiver_state="SOCKET_ERROR", reason=str(exc))
-                self._close_broadcast_socket(locals().get("sock"))
-                time.sleep(0.5)
-            except Exception as exc:
-                self._broadcast_diag("receiver_exception", receiver_state="RETRYING", reason=str(exc))
-                self._close_broadcast_socket(locals().get("sock"))
-                time.sleep(0.5)
-
-    def _broadcast_audio_receiver_loop(self) -> None:
-        while True:
-            try:
-                snapshot = self._state_snapshot()
-                if not snapshot["broadcast_active"]:
-                    self._close_broadcast_audio_socket()
-                    time.sleep(0.2)
-                    continue
-                if sd is None:
-                    if not self._broadcast_audio_missing_warned:
-                        print("[Broadcast Audio] sounddevice is not installed.")
-                        self._broadcast_audio_missing_warned = True
-                    time.sleep(2.0)
-                    continue
-                self._broadcast_audio_missing_warned = False
-                try:
-                    with sd.OutputStream(
-                        samplerate=AUDIO_SAMPLE_RATE,
-                        channels=AUDIO_CHANNELS,
-                        dtype=AUDIO_DTYPE,
-                        blocksize=AUDIO_BLOCK_SIZE,
-                    ) as stream:
-                        self._broadcast_audio_device_warned = False
-                        while True:
-                            snapshot = self._state_snapshot()
-                            if not snapshot["broadcast_active"]:
-                                self._close_broadcast_audio_socket()
-                                break
-                            with self.conn_lock:
-                                sock = self.broadcast_audio_sock
-                            if sock is None:
-                                if (not snapshot["connected"]) or (not self.pc_id):
-                                    time.sleep(0.2)
-                                    continue
-                                if not self._connect_broadcast_audio():
-                                    time.sleep(1.0)
-                                continue
-                            audio_data = recv_frame(sock)
-                            if audio_data is None:
-                                self._close_broadcast_audio_socket()
-                                time.sleep(0.2)
-                                continue
-                            if len(audio_data) % numpy.dtype(numpy.int16).itemsize != 0:
-                                continue
-                            samples = numpy.frombuffer(audio_data, dtype=numpy.int16)
-                            if samples.size == 0:
-                                continue
-                            stream.write(samples.reshape(-1, AUDIO_CHANNELS))
-                except Exception as exc:
-                    if not self._broadcast_audio_device_warned:
-                        print(f"[Broadcast Audio] {exc}")
-                        self._broadcast_audio_device_warned = True
-                    self._close_broadcast_audio_socket()
-                    time.sleep(1.0)
-            except OSError:
-                self._close_broadcast_audio_socket()
-                time.sleep(0.5)
-            except Exception:
-                self._close_broadcast_audio_socket()
-                time.sleep(0.5)
 
     def _on_timer_warning(self, timer_id: str, remaining_ms: int) -> None:
         if not self.enable_timer_near_limit_notify:
@@ -2425,8 +1939,6 @@ class StudentDeployClient:
         threading.Thread(target=self._control_loop, daemon=True).start()
         threading.Thread(target=self._udp_fallback_loop, daemon=True).start()
         threading.Thread(target=self._video_loop, daemon=True).start()
-        threading.Thread(target=self._broadcast_receiver_loop, daemon=True).start()
-        threading.Thread(target=self._broadcast_audio_receiver_loop, daemon=True).start()
 
         try:
             while True:
