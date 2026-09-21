@@ -237,10 +237,14 @@ class ScreenShareBroadcaster:
         source_done = threading.Event()
         self._log("screen_share_audio_capture_started", session_id=session_id)
 
-        def normalize_pcm(chunk: bytes, source_rate: int, source_channels: int, state: object) -> tuple[bytes, object]:
+        def normalize_pcm(chunk: bytes, source_rate: int, source_channels: int) -> bytes:
+            """Convert a captured source to the fixed, existing network format."""
             samples = numpy.frombuffer(chunk, dtype=numpy.int16)
             if samples.size % source_channels:
                 samples = samples[:samples.size - (samples.size % source_channels)]
+            expected_samples = self.audio_chunk_frames * self.audio_channels
+            if not samples.size:
+                return b"\0" * (expected_samples * 2)
             samples = samples.reshape(-1, source_channels)
             if source_channels == 1 and self.audio_channels == 2:
                 samples = numpy.repeat(samples, 2, axis=1)
@@ -251,11 +255,10 @@ class ScreenShareBroadcaster:
                 source_axis = numpy.arange(samples.shape[0])
                 target_axis = numpy.linspace(0, samples.shape[0] - 1, target_frames)
                 samples = numpy.stack([numpy.interp(target_axis, source_axis, samples[:, channel]) for channel in range(self.audio_channels)], axis=1).astype(numpy.int16)
-            expected_samples = self.audio_chunk_frames * self.audio_channels
             flattened = samples.reshape(-1)[:expected_samples]
             if flattened.size < expected_samples:
                 flattened = numpy.pad(flattened, (0, expected_samples - flattened.size))
-            return flattened.astype(numpy.int16, copy=False).tobytes(), state
+            return flattened.astype(numpy.int16, copy=False).tobytes()
 
         def capture_source(kind: str) -> None:
             stream = audio = None
@@ -267,8 +270,14 @@ class ScreenShareBroadcaster:
                     if not device:
                         raise RuntimeError("default WASAPI loopback device unavailable")
                 else:
+                    # This is PyAudio's default *input* endpoint: on Windows it
+                    # is the user's selected laptop/USB microphone, not the
+                    # WASAPI playback-loopback endpoint used above.  Do not
+                    # reject the returned device based on optional PyAudioWPatch
+                    # metadata; some driver builds mark a valid default input
+                    # inconsistently, which previously prevented mic capture.
                     device = audio.get_default_input_device_info()
-                    if not device or device.get("isLoopbackDevice"):
+                    if not device:
                         raise RuntimeError("default microphone input device unavailable")
                 source_channels = min(self.audio_channels, int(device.get("maxInputChannels", 0)))
                 if source_channels <= 0:
@@ -279,10 +288,9 @@ class ScreenShareBroadcaster:
                                     input=True, input_device_index=device["index"], frames_per_buffer=source_frames)
                 self._log("screen_share_audio_source_started", session_id=session_id, source=kind,
                           rate=source_rate, channels=source_channels, chunk_frames=source_frames)
-                rate_state = None
                 while self._session_current(session_id) and not source_done.is_set():
                     raw = stream.read(source_frames, exception_on_overflow=False)
-                    chunk, rate_state = normalize_pcm(raw, source_rate, source_channels, rate_state)
+                    chunk = normalize_pcm(raw, source_rate, source_channels)
                     try:
                         source_queues[kind].put_nowait(chunk)
                     except queue.Full:
