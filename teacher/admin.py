@@ -19,6 +19,7 @@ import cv2
 import customtkinter as ctk
 import mss
 import numpy
+import sounddevice as sd
 from PIL import Image, ImageDraw, ImageFont, ImageTk
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -162,7 +163,7 @@ STATUS_COLORS = THEME_STATUS_COLORS
 CONVERSATION_TTL_S = 6 * 60 * 60
 CONVERSATION_MAX_PCS = 500
 
-VALID_COMMAND_ACKS = {"LOCK_NOW", "UNLOCK_NOW", "SET_TIMER", "EXTEND_TIMER", "CANCEL_TIMER", "TIMER_EXPIRED", "TIMER_WARNING", "SET_STREAM_PROFILE", "SET_RUNTIME_TUNING", "SESSION_MESSAGE", "EXTENSION_REQUEST", "EXTENSION_OFFER", "PAUSE_TIMER", "RESUME_TIMER", "SHUTDOWN", "RESTART"}
+VALID_COMMAND_ACKS = {"LOCK_NOW", "UNLOCK_NOW", "SET_TIMER", "EXTEND_TIMER", "CANCEL_TIMER", "TIMER_EXPIRED", "TIMER_WARNING", "SET_STREAM_PROFILE", "SET_RUNTIME_TUNING", "SESSION_MESSAGE", "EXTENSION_REQUEST", "EXTENSION_OFFER", "PAUSE_TIMER", "RESUME_TIMER", "SCREEN_SHARE_START", "SCREEN_SHARE_STOP", "SHUTDOWN", "RESTART"}
 ERROR_CODES = {
     "CONTROL_VALIDATION_ERROR",
     "SENSOR_VALIDATION_ERROR",
@@ -215,6 +216,13 @@ class TeacherDeployServer:
         self.extension_status_by_pc: dict[str, str] = {}
         self.session_extension_ms_by_timer_pc: dict[tuple[str, str], int] = {}
         self.video_status_last_ts_by_pc: dict[str, float] = {}
+        # Screen-share media is deliberately separate from student monitoring video.
+        self.screen_share_session_id: Optional[str] = None
+        self.screen_share_targets: set[str] = set()
+        self.screen_share_timer_paused_by_us: set[str] = set()
+        self.screen_share_stop_event = threading.Event()
+        self.screen_share_video_queues: dict[str, queue.Queue[bytes]] = {}
+        self.screen_share_audio_queues: dict[str, queue.Queue[bytes]] = {}
         self.udp_send_sock: Optional[socket.socket] = None
         self.udp_send_lock = threading.Lock()
         self.timers_file = ROOT / "data" / "active_timers.json"
@@ -571,6 +579,8 @@ class TeacherDeployServer:
         threading.Thread(target=self._run_video_server, daemon=True).start()
         threading.Thread(target=self._run_sensor_server, daemon=True).start()
         threading.Thread(target=self._run_udp_fallback_server, daemon=True).start()
+        threading.Thread(target=self._run_screen_share_media_server, args=(NETWORK.screen_share_video_port, "video"), daemon=True).start()
+        threading.Thread(target=self._run_screen_share_media_server, args=(NETWORK.screen_share_audio_port, "audio"), daemon=True).start()
         threading.Thread(target=self._run_guarded_loop, args=("heartbeat_monitor", self._monitor_heartbeats), daemon=True).start()
         threading.Thread(target=self._run_guarded_loop, args=("reconciliation", self._run_reconciliation_loop), daemon=True).start()
         threading.Thread(target=self._run_guarded_loop, args=("observability", self._run_observability_loop), daemon=True).start()
@@ -678,6 +688,15 @@ class TeacherDeployServer:
                         "max_fps": RUNTIME.max_fps,
                     })
                     self.send_command(assigned, "SET_RUNTIME_TUNING", {"reconnect_interval_s": int(self.settings.reconnect_interval_s)})
+                    with self.lock:
+                        active_share_id = self.screen_share_session_id if assigned in self.screen_share_targets else None
+                    if active_share_id:
+                        self.send_command(assigned, "SCREEN_SHARE_START", {
+                            "session_id": active_share_id,
+                            "sample_rate": RUNTIME.screen_share_audio_sample_rate,
+                            "channels": RUNTIME.screen_share_audio_channels,
+                        }, allow_udp_fallback=False)
+                        self._log_event("SCREEN_SHARE_RECONNECT", pc_id=assigned, session_id=active_share_id)
                     if assigned in self.pending_signout_lock_pc_ids:
                         with self.lock:
                             client_ref = self.clients.get(assigned)
@@ -1152,6 +1171,7 @@ class TeacherDeployServer:
             self.message_events.append(event)
             self._append_conversation_message(pc_id, client.auth_session_id, "student_to_teacher", text, event["ts"])
         self._put_bounded(self.status_queue, pc_id)
+        self._log_event("CHAT_UNREAD_SET", pc_id=pc_id)
         self._log_event("student_session_message", pc_id=pc_id, text=text)
 
     def _handle_student_extension_request(self, msg: dict, pc_id: str) -> None:
@@ -1666,6 +1686,112 @@ class TeacherDeployServer:
                 "max_fps": RUNTIME.max_fps,
             })
 
+    def eligible_screen_share_targets(self) -> list[str]:
+        with self.lock:
+            return [pc_id for pc_id, client in self.clients.items() if client.online and client.control_sock is not None]
+
+    def start_screen_share(self) -> bool:
+        targets = self.eligible_screen_share_targets()
+        if not targets:
+            self._log_event("SCREEN_SHARE_START_REQUESTED", result="no_eligible_students")
+            return False
+        with self.lock:
+            if self.screen_share_session_id:
+                return True
+            session_id, now = uuid.uuid4().hex, time.time()
+            self.screen_share_session_id, self.screen_share_targets = session_id, set(targets)
+            self.screen_share_timer_paused_by_us.clear(); self.screen_share_stop_event.clear()
+            for pc_id in targets:
+                client = self.clients.get(pc_id)
+                if client and client.current_user and client.session_timer and not client.session_timer.paused:
+                    client.session_timer.paused, client.session_timer.paused_at_ts = True, now
+                    self.screen_share_timer_paused_by_us.add(pc_id)
+        self._persist_session_timers()
+        payload = {"session_id": session_id, "sample_rate": RUNTIME.screen_share_audio_sample_rate, "channels": RUNTIME.screen_share_audio_channels}
+        for pc_id in targets:
+            self.send_command(pc_id, "SCREEN_SHARE_START", payload, allow_udp_fallback=False)
+        threading.Thread(target=self._screen_share_video_capture_loop, args=(session_id,), daemon=True).start()
+        threading.Thread(target=self._screen_share_microphone_loop, args=(session_id,), daemon=True).start()
+        self._log_event("SCREEN_SHARE_STARTED", session_id=session_id, targets=len(targets))
+        return True
+
+    def stop_screen_share(self) -> None:
+        with self.lock:
+            session_id = self.screen_share_session_id
+            if not session_id: return
+            targets, resume, now = list(self.screen_share_targets), list(self.screen_share_timer_paused_by_us), time.time()
+            self.screen_share_session_id = None; self.screen_share_targets.clear(); self.screen_share_timer_paused_by_us.clear(); self.screen_share_stop_event.set()
+            self.screen_share_video_queues.clear(); self.screen_share_audio_queues.clear()
+            for pc_id in resume:
+                client = self.clients.get(pc_id); timer = client.session_timer if client else None
+                if timer and timer.paused:
+                    if timer.paused_at_ts is not None: timer.paused_accum_ms += max(0, int((now - timer.paused_at_ts) * 1000))
+                    timer.paused, timer.paused_at_ts = False, None
+        self._persist_session_timers()
+        for pc_id in targets: self.send_command(pc_id, "SCREEN_SHARE_STOP", {"session_id": session_id}, allow_udp_fallback=False)
+        self._log_event("SCREEN_SHARE_STOPPED", session_id=session_id)
+
+    def _screen_share_fanout(self, queues: dict[str, queue.Queue[bytes]], payload: bytes) -> None:
+        with self.lock: recipients = list(queues.items())
+        for _pc_id, out_q in recipients: self._put_bounded(out_q, payload)
+
+    def _screen_share_video_capture_loop(self, session_id: str) -> None:
+        try:
+            with mss.mss() as capture:
+                monitor = capture.monitors[1]
+                while not self.screen_share_stop_event.is_set() and self.screen_share_session_id == session_id:
+                    frame = cv2.cvtColor(numpy.array(capture.grab(monitor)), cv2.COLOR_BGRA2BGR)
+                    ok, jpeg = cv2.imencode(".jpg", frame, [int(cv2.IMWRITE_JPEG_QUALITY), 70])
+                    if ok: self._screen_share_fanout(self.screen_share_video_queues, jpeg.tobytes())
+                    self.screen_share_stop_event.wait(1 / max(1, RUNTIME.max_fps))
+        except Exception as exc: self._log_event("screen_share_video_capture_failed", session_id=session_id, reason=str(exc))
+
+    def _screen_share_microphone_loop(self, session_id: str) -> None:
+        # RawInputStream uses sounddevice's default input (microphone), never output/loopback audio.
+        def callback(indata, _frames, _time_info, status) -> None:
+            if status: self._log_event("microphone_capture_status", session_id=session_id, detail=str(status))
+            if self.screen_share_session_id == session_id and not self.screen_share_stop_event.is_set(): self._screen_share_fanout(self.screen_share_audio_queues, bytes(indata))
+        try:
+            with sd.RawInputStream(samplerate=RUNTIME.screen_share_audio_sample_rate, channels=RUNTIME.screen_share_audio_channels, dtype="int16", blocksize=RUNTIME.screen_share_audio_blocksize, callback=callback):
+                self._log_event("MICROPHONE_CAPTURE_STARTED", session_id=session_id)
+                while not self.screen_share_stop_event.wait(.2) and self.screen_share_session_id == session_id: pass
+        except Exception as exc: self._log_event("MICROPHONE_CAPTURE_FAILED", session_id=session_id, reason=str(exc))
+        finally: self._log_event("MICROPHONE_CAPTURE_STOPPED", session_id=session_id)
+
+    def _run_screen_share_media_server(self, port: int, media_type: str) -> None:
+        while True:
+            sock = None
+            try:
+                sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM); sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1); sock.bind((self.settings.teacher_bind_host, port)); sock.listen()
+                while True:
+                    client_sock, _ = sock.accept(); threading.Thread(target=self._screen_share_media_client_loop, args=(client_sock, media_type), daemon=True).start()
+            except OSError as exc: self._log_event("screen_share_media_server_restart", media=media_type, reason=str(exc)); time.sleep(1)
+            finally:
+                if sock: sock.close()
+
+    def _screen_share_media_client_loop(self, client_sock: socket.socket, media_type: str) -> None:
+        out_q = None; pc_id = ""
+        try:
+            file_obj = client_sock.makefile("rb"); registration = recv_json_line(file_obj)
+            if not registration or registration.get("type") != "screen_share_register": return
+            pc_id, session_id = str(registration.get("pc_id", "")), str(registration.get("session_id", ""))
+            with self.lock:
+                if not pc_id or session_id != self.screen_share_session_id or pc_id not in self.screen_share_targets: return
+                queues = self.screen_share_video_queues if media_type == "video" else self.screen_share_audio_queues
+                out_q = queue.Queue(maxsize=RUNTIME.screen_share_queue_max); queues[pc_id] = out_q
+            self._log_event("STUDENT_SCREEN_SHARE_CONNECTED", pc_id=pc_id, media=media_type, session_id=session_id)
+            while self.screen_share_session_id == session_id and not self.screen_share_stop_event.is_set():
+                try: send_frame(client_sock, out_q.get(timeout=.5))
+                except queue.Empty: continue
+        except (OSError, ValueError) as exc: self._log_event("screen_share_media_client_error", pc_id=pc_id, media=media_type, reason=str(exc))
+        finally:
+            with self.lock:
+                queues = self.screen_share_video_queues if media_type == "video" else self.screen_share_audio_queues
+                if pc_id and queues.get(pc_id) is out_q: queues.pop(pc_id, None)
+            try: client_sock.close()
+            except OSError: pass
+            if pc_id: self._log_event("STUDENT_SCREEN_SHARE_DISCONNECTED", pc_id=pc_id, media=media_type)
+
     def send_command(self, pc_id: str, command: str, payload: Optional[dict] = None, *, allow_udp_fallback: bool = True) -> Optional[str]:
         if command in {"SHUTDOWN", "RESTART"}:
             allow_udp_fallback = False
@@ -2011,6 +2137,8 @@ class TeacherDeployUI:
             **BUTTON_NEUTRAL,
         )
         self.chat_btn.pack(side="right", padx=(8, 0), after=self.reservations_button)
+        self.chat_unread_dot = ctk.CTkFrame(self.chat_btn, width=10, height=10, corner_radius=5, fg_color="#DC2626")
+        self.chat_unread_dot.place_forget()
         self.students_button = ctk.CTkButton(
             title_row,
             text="Students",
@@ -2145,6 +2273,8 @@ class TeacherDeployUI:
         self.extend_timer_btn.pack(side="left", padx=4)
         self.cancel_timer_btn = ctk.CTkButton(timer_group, text="Cancel", command=self._cancel_timer, width=96, height=34, **BUTTON_NEUTRAL)
         self.cancel_timer_btn.pack(side="left", padx=4)
+        self.screen_share_btn = ctk.CTkButton(timer_group, text="Share Screen", command=self._toggle_screen_share, width=120, height=34, **BUTTON_PRIMARY)
+        self.screen_share_btn.pack(side="left", padx=(12, 4))
 
         self.dashboard_hint_title = ctk.CTkLabel(
             self.right_controls_frame,
@@ -2302,6 +2432,7 @@ class TeacherDeployUI:
             "Exit Admin Dashboard",
             "Closing this window also stops the lab server for the computer lab.\n\nDo you want to exit?",
         ):
+            self.server.stop_screen_share()
             self.root.destroy()
 
 
@@ -2457,6 +2588,15 @@ class TeacherDeployUI:
         self._configure_if_changed(self.unlock_btn, state="normal" if can_unlock else "disabled")
         self._configure_if_changed(self.extend_timer_btn, state="normal" if can_extend else "disabled")
         self._configure_if_changed(self.cancel_timer_btn, state="normal" if can_cancel else "disabled")
+        sharing = bool(self.server.screen_share_session_id)
+        eligible = bool(self.server.eligible_screen_share_targets())
+        self._configure_if_changed(self.screen_share_btn, text="Stop Sharing" if sharing else "Share Screen", state="normal" if sharing or eligible else "disabled")
+        with self.server.lock:
+            has_unread = any(int(convo.get("unread", 0)) > 0 for convo in self.server.conversations.values())
+        if has_unread:
+            self.chat_unread_dot.place(relx=1.0, rely=0.0, x=-7, y=5, anchor="ne")
+        else:
+            self.chat_unread_dot.place_forget()
 
         # can_ext_approve = bool(self.server.settings.enable_extension_requests) and len(logged) == 1
         # self._configure_if_changed(self.approve_ext_btn, state="normal" if can_ext_approve else "disabled")
@@ -2472,6 +2612,16 @@ class TeacherDeployUI:
                 self.chat_sidebar_window.destroy()
             self.chat_sidebar_window = None
             self.chat_sidebar_body = None
+
+    def _toggle_screen_share(self) -> None:
+        if self.server.screen_share_session_id:
+            self.server.stop_screen_share()
+            self._set_runtime_notice("Screen sharing stopped.")
+        elif self.server.start_screen_share():
+            self._set_runtime_notice("Screen sharing active.")
+        else:
+            self._set_runtime_notice("No connected students are available for screen sharing.", ESSU_WARNING, hold_s=8.0)
+        self._refresh_control_buttons()
 
     def _lock_targets(self) -> None:
         mode = self.lock_mode_var.get()
@@ -2587,6 +2737,12 @@ class TeacherDeployUI:
     def _open_chat_sidebar(self) -> None:
         if not bool(self.server.settings.enable_session_messaging):
             return
+        # Opening the dashboard chat is the read lifecycle for its single badge.
+        with self.server.lock:
+            for convo in self.server.conversations.values():
+                convo["unread"] = 0
+        self.server._log_event("CHAT_UNREAD_CLEARED")
+        self._refresh_control_buttons()
         if self.chat_sidebar_window is not None and self.chat_sidebar_window.winfo_exists():
             self.chat_sidebar_window.lift()
             try:

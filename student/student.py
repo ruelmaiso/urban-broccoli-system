@@ -20,6 +20,7 @@ import numpy
 import os
 import platform
 import psutil
+import sounddevice as sd
 from PIL import Image, ImageTk
 import sys
 
@@ -35,7 +36,7 @@ ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT))
 
 from config.deploy_settings import NETWORK, RUNTIME
-from core.protocol import recv_json_line, send_frame, send_json
+from core.protocol import recv_frame, recv_json_line, send_frame, send_json
 from core.student_settings import StudentSettings, StudentSettingsStore, normalize_teacher_host
 
 STUDENT_LOG_DIR = ROOT / "logs"
@@ -99,6 +100,11 @@ class OverlayController:
         self._chat_launcher_pos: Optional[tuple[int, int]] = None
         self._chat_launcher_drag_state: Optional[dict] = None
         self._chat_launcher_suppress_click_until = 0.0
+        self._screen_share_window: Optional[ctk.CTkToplevel] = None
+        self._screen_share_label: Optional[ctk.CTkLabel] = None
+        self._screen_share_image: Optional[ImageTk.PhotoImage] = None
+        self._screen_share_frame_lock = threading.Lock()
+        self._screen_share_frame_pending = False
 
         logo_path = resource_path("assets/essu_logo.png")
         try:
@@ -951,6 +957,14 @@ class OverlayController:
                             elif cmd == "chat_visibility":
                                 self._set_chat_enabled_ui(bool(payload.get("enabled", False)))
                                 result["ok"] = True
+                            elif cmd == "screen_share_frame":
+                                self._show_screen_share_frame(payload["image"])
+                                with self._screen_share_frame_lock:
+                                    self._screen_share_frame_pending = False
+                                result["ok"] = True
+                            elif cmd == "screen_share_close":
+                                payload["callback"]()
+                                result["ok"] = True
                             else:
                                 result["ok"] = False
                         except Exception:
@@ -1004,6 +1018,42 @@ class OverlayController:
             return False
 
         return bool(result.get("ok"))
+
+    def _show_screen_share_frame(self, image: Image.Image) -> None:
+        assert self._root is not None
+        if self._screen_share_window is None or not self._screen_share_window.winfo_exists():
+            win = ctk.CTkToplevel(self._root)
+            win.title("Admin Screen Share")
+            win.geometry("1100x700")
+            win.protocol("WM_DELETE_WINDOW", lambda: None)  # teacher controls the session lifecycle
+            self._screen_share_window = win
+            self._screen_share_label = ctk.CTkLabel(win, text="")
+            self._screen_share_label.pack(fill="both", expand=True)
+        image.thumbnail((1080, 680))
+        self._screen_share_image = ImageTk.PhotoImage(image)
+        if self._screen_share_label is not None:
+            self._screen_share_label.configure(image=self._screen_share_image, text="")
+
+    def show_screen_share_frame_async(self, image: Image.Image) -> bool:
+        self._ensure_worker()
+        if not self._ui_ready_event.is_set():
+            return False
+        with self._screen_share_frame_lock:
+            if self._screen_share_frame_pending:
+                return False
+            self._screen_share_frame_pending = True
+        self._cmd_q.put(("screen_share_frame", {"image": image}, threading.Event(), {"ok": False}))
+        return True
+
+    def close_screen_share_async(self) -> None:
+        def close() -> None:
+            if self._screen_share_window is not None and self._screen_share_window.winfo_exists():
+                self._screen_share_window.destroy()
+            self._screen_share_window = None
+            self._screen_share_label = None
+            self._screen_share_image = None
+        self._ensure_worker()
+        self._cmd_q.put(("screen_share_close", {"callback": close}, threading.Event(), {"ok": False}))
 
     def set_chat_enabled(self, enabled: bool, timeout_s: float = 1.0) -> bool:
         self._ensure_worker()
@@ -1213,6 +1263,10 @@ class StudentDeployClient:
         self.udp_send_lock = threading.Lock()
         self._showing_connection_overlay = False
         self.logger = _student_logger()
+        self.screen_share_session_id: Optional[str] = None
+        self.screen_share_stop_event = threading.Event()
+        self.screen_share_timer_paused_by_share = False
+        self.screen_share_lock = threading.Lock()
 
     def get_teacher_ip(self) -> str:
         return self.teacher_ip
@@ -1516,6 +1570,15 @@ class StudentDeployClient:
             except Exception:
                 applied = False
                 reason = "resume_timer_failed"
+        elif command == "SCREEN_SHARE_START":
+            session_id = str(msg.get("session_id", "")).strip()
+            if not session_id:
+                applied, reason = False, "missing_screen_share_session_id"
+            else:
+                self._start_screen_share(session_id, int(msg.get("sample_rate", RUNTIME.screen_share_audio_sample_rate)), int(msg.get("channels", RUNTIME.screen_share_audio_channels)))
+        elif command == "SCREEN_SHARE_STOP":
+            session_id = str(msg.get("session_id", "")).strip()
+            self._stop_screen_share(session_id)
         elif command == "SESSION_MESSAGE":
             try:
                 if self.enable_session_messaging:
@@ -1691,6 +1754,91 @@ class StudentDeployClient:
         except (OSError, ValueError):
             self._cleanup_sockets()
             return False
+
+    def _start_screen_share(self, session_id: str, sample_rate: int, channels: int) -> None:
+        with self.screen_share_lock:
+            if self.screen_share_session_id == session_id:
+                return
+            self._stop_screen_share_locked()
+            self.screen_share_session_id = session_id
+            self.screen_share_stop_event.clear()
+            # Preserve an already-paused timer: only resume what this feature paused.
+            with self.timer_manager.lock:
+                timer = self.timer_manager.timers.get(self.session_timer_id)
+                self.screen_share_timer_paused_by_share = bool(timer and not timer.get("paused"))
+            if self.screen_share_timer_paused_by_share:
+                self.timer_manager.pause_timer(self.session_timer_id)
+            self.logger.info("SCREEN_SHARE_STARTED session_id=%s", session_id)
+            threading.Thread(target=self._screen_share_video_receiver, args=(session_id,), daemon=True).start()
+            threading.Thread(target=self._screen_share_audio_receiver, args=(session_id, sample_rate, channels), daemon=True).start()
+
+    def _stop_screen_share_locked(self) -> None:
+        session_id = self.screen_share_session_id
+        if not session_id:
+            return
+        self.screen_share_stop_event.set()
+        if self.screen_share_timer_paused_by_share:
+            self.timer_manager.resume_timer(self.session_timer_id)
+        self.screen_share_timer_paused_by_share = False
+        self.screen_share_session_id = None
+        self.overlay.close_screen_share_async()
+        self.logger.info("SCREEN_SHARE_STOPPED session_id=%s", session_id)
+
+    def _stop_screen_share(self, session_id: str) -> None:
+        with self.screen_share_lock:
+            # A delayed stop must never terminate a newer session.
+            if session_id and session_id != self.screen_share_session_id:
+                return
+            self._stop_screen_share_locked()
+
+    def _screen_share_connect(self, port: int, session_id: str, media: str) -> Optional[socket.socket]:
+        if not self.pc_id:
+            return None
+        try:
+            sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+            sock.settimeout(5)
+            sock.connect((self.teacher_ip, port))
+            send_json(sock, {"type": "screen_share_register", "pc_id": self.pc_id, "session_id": session_id, "media": media})
+            sock.settimeout(None)
+            return sock
+        except OSError as exc:
+            self.logger.error("SCREEN_SHARE_CONNECT_FAILED media=%s session_id=%s reason=%s", media, session_id, exc)
+            try: sock.close()
+            except Exception: pass
+            return None
+
+    def _screen_share_video_receiver(self, session_id: str) -> None:
+        sock = self._screen_share_connect(NETWORK.screen_share_video_port, session_id, "video")
+        if not sock: return
+        try:
+            while not self.screen_share_stop_event.is_set() and self.screen_share_session_id == session_id:
+                payload = recv_frame(sock)
+                if payload is None: break
+                image = cv2.imdecode(numpy.frombuffer(payload, dtype=numpy.uint8), cv2.IMREAD_COLOR)
+                if image is not None:
+                    rgb = cv2.cvtColor(image, cv2.COLOR_BGR2RGB)
+                    self.overlay.show_screen_share_frame_async(Image.fromarray(rgb))
+        except Exception as exc:
+            self.logger.error("SCREEN_SHARE_VIDEO_FAILED session_id=%s reason=%s", session_id, exc)
+        finally:
+            try: sock.close()
+            except OSError: pass
+
+    def _screen_share_audio_receiver(self, session_id: str, sample_rate: int, channels: int) -> None:
+        sock = self._screen_share_connect(NETWORK.screen_share_audio_port, session_id, "audio")
+        if not sock: return
+        try:
+            with sd.RawOutputStream(samplerate=sample_rate, channels=channels, dtype="int16") as output:
+                while not self.screen_share_stop_event.is_set() and self.screen_share_session_id == session_id:
+                    payload = recv_frame(sock)
+                    if payload is None: break
+                    output.write(payload)
+        except Exception as exc:
+            # Playback failure is isolated; video and session timer remain operational.
+            self.logger.error("SCREEN_SHARE_AUDIO_FAILED session_id=%s reason=%s", session_id, exc)
+        finally:
+            try: sock.close()
+            except OSError: pass
 
     def _connect_video(self) -> bool:
         if not self.pc_id:
