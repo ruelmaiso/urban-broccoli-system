@@ -226,15 +226,14 @@ class ScreenShareBroadcaster:
             self._log("screen_share_capture_stopped", session_id=session_id)
 
     def _audio_producer(self, session_id: str) -> None:
-        """Mix WASAPI loopback and the default input into the existing PCM stream.
+        """Capture only the Admin's default physical microphone input.
 
-        The wire contract remains signed 16-bit little-endian PCM at the configured
-        rate/channel count, so viewers still need only one playback stream.  Each
-        source owns its PyAudio instance: a failed microphone must not take down
-        loopback capture (and vice versa).
+        The established Student audio protocol is retained: signed 16-bit PCM at
+        the configured rate/channel count and fixed frame size.  In particular,
+        this deliberately does not use WASAPI loopback or any desktop-output
+        capture path.
         """
-        source_queues = {"system": queue.Queue(maxsize=4), "microphone": queue.Queue(maxsize=4)}
-        source_done = threading.Event()
+        stream = audio = None
         self._log("screen_share_audio_capture_started", session_id=session_id)
 
         def normalize_pcm(chunk: bytes, source_rate: int, source_channels: int) -> bytes:
@@ -260,78 +259,53 @@ class ScreenShareBroadcaster:
                 flattened = numpy.pad(flattened, (0, expected_samples - flattened.size))
             return flattened.astype(numpy.int16, copy=False).tobytes()
 
-        def capture_source(kind: str) -> None:
-            stream = audio = None
-            try:
-                import pyaudiowpatch as pyaudio
-                audio = pyaudio.PyAudio()
-                if kind == "system":
-                    device = audio.get_default_wasapi_loopback()
-                    if not device:
-                        raise RuntimeError("default WASAPI loopback device unavailable")
-                else:
-                    # This is PyAudio's default *input* endpoint: on Windows it
-                    # is the user's selected laptop/USB microphone, not the
-                    # WASAPI playback-loopback endpoint used above.  Do not
-                    # reject the returned device based on optional PyAudioWPatch
-                    # metadata; some driver builds mark a valid default input
-                    # inconsistently, which previously prevented mic capture.
-                    device = audio.get_default_input_device_info()
-                    if not device:
-                        raise RuntimeError("default microphone input device unavailable")
-                source_channels = min(self.audio_channels, int(device.get("maxInputChannels", 0)))
-                if source_channels <= 0:
-                    raise RuntimeError("audio input device has no input channels")
-                source_rate = max(8000, int(float(device.get("defaultSampleRate", self.audio_rate))))
-                source_frames = max(1, round(self.audio_chunk_frames * source_rate / self.audio_rate))
-                stream = audio.open(format=pyaudio.paInt16, channels=source_channels, rate=source_rate,
-                                    input=True, input_device_index=device["index"], frames_per_buffer=source_frames)
-                self._log("screen_share_audio_source_started", session_id=session_id, source=kind,
-                          rate=source_rate, channels=source_channels, chunk_frames=source_frames)
-                while self._session_current(session_id) and not source_done.is_set():
-                    raw = stream.read(source_frames, exception_on_overflow=False)
-                    chunk = normalize_pcm(raw, source_rate, source_channels)
-                    try:
-                        source_queues[kind].put_nowait(chunk)
-                    except queue.Full:
-                        try: source_queues[kind].get_nowait()
-                        except queue.Empty: pass
-                        try: source_queues[kind].put_nowait(chunk)
-                        except queue.Full: pass
-            except Exception as exc:
-                self._log("screen_share_audio_source_failed", session_id=session_id, source=kind, reason=str(exc))
-            finally:
-                if stream:
-                    try: stream.stop_stream(); stream.close()
-                    except Exception: pass
-                if audio:
-                    try: audio.terminate()
-                    except Exception: pass
-
-        workers = [threading.Thread(target=capture_source, args=(kind,), daemon=True,
-                                    name=f"screen-share-{kind}-audio") for kind in source_queues]
-        for worker in workers:
-            worker.start()
-        expected = self.audio_chunk_frames * self.audio_channels * 2
-        silence = b"\0" * expected
-        latest = {"system": silence, "microphone": silence}
         try:
+            import pyaudiowpatch as pyaudio
+            audio = pyaudio.PyAudio()
+            # PyAudioWPatch exposes the operating system's default *input*
+            # endpoint through this API.  It is the safest available choice for
+            # the Admin's selected built-in/USB microphone without inventing a
+            # device-selection mechanism.
+            microphone = audio.get_default_input_device_info()
+            if not microphone:
+                raise RuntimeError("default microphone input device unavailable")
+            if bool(microphone.get("isLoopbackDevice", False)):
+                raise RuntimeError("default input device is a loopback endpoint, not a microphone")
+            source_channels = min(self.audio_channels, int(microphone.get("maxInputChannels", 0)))
+            if source_channels <= 0:
+                raise RuntimeError("default microphone has no input channels")
+            source_rate = max(8000, int(float(microphone.get("defaultSampleRate", self.audio_rate))))
+            source_frames = max(1, round(self.audio_chunk_frames * source_rate / self.audio_rate))
+            stream = audio.open(
+                format=pyaudio.paInt16,
+                channels=source_channels,
+                rate=source_rate,
+                input=True,
+                input_device_index=microphone["index"],
+                frames_per_buffer=source_frames,
+            )
+            self._log(
+                "screen_share_microphone_started",
+                session_id=session_id,
+                device_index=microphone["index"],
+                device_name=str(microphone.get("name", "")),
+                rate=source_rate,
+                channels=source_channels,
+                chunk_frames=source_frames,
+            )
             while self._session_current(session_id):
-                produced = False
-                for kind, packets in source_queues.items():
-                    try:
-                        latest[kind] = packets.get(timeout=0.02 if kind == "system" else 0.0)
-                        produced = True
-                    except queue.Empty:
-                        latest[kind] = silence
-                if produced:
-                    # -6 dB per source prevents clipping when both are loud.
-                    system = numpy.frombuffer(latest["system"], dtype=numpy.int16).astype(numpy.int32)
-                    microphone = numpy.frombuffer(latest["microphone"], dtype=numpy.int16).astype(numpy.int32)
-                    mixed = numpy.clip((system + microphone) // 2, -32768, 32767).astype(numpy.int16).tobytes()
-                    self._distribute("audio", mixed)
-                else:
-                    time.sleep(self.audio_chunk_frames / self.audio_rate)
+                raw = stream.read(source_frames, exception_on_overflow=False)
+                self._distribute("audio", normalize_pcm(raw, source_rate, source_channels))
+        except Exception as exc:
+            # This worker is isolated from capture, control, and per-viewer
+            # sender threads.  Failure leaves screen sharing active without
+            # fabricated/silent audio and records the real device error.
+            self._log("screen_share_microphone_failed", session_id=session_id, reason=str(exc))
         finally:
-            source_done.set()
+            if stream:
+                try: stream.stop_stream(); stream.close()
+                except Exception: pass
+            if audio:
+                try: audio.terminate()
+                except Exception: pass
             self._log("screen_share_audio_capture_stopped", session_id=session_id)
