@@ -13,6 +13,8 @@ class NetworkConfig:
     video_port: int = 9200
     sensor_port: int = 9202
     command_fallback_port: int = 9203
+    screen_share_video_port: int = 9204
+    screen_share_audio_port: int = 9205
 
 
 @dataclass(frozen=True)
@@ -29,6 +31,10 @@ class RuntimeConfig:
     sensor_timeout_s: int = 10
     timer_tick_s: float = 0.5
     session_disconnect_grace_s: int = 30
+    screen_share_audio_sample_rate: int = 16000
+    screen_share_audio_channels: int = 1
+    screen_share_audio_blocksize: int = 1024
+    screen_share_queue_max: int = 3
 
 
 NETWORK = NetworkConfig()
@@ -74,4 +80,4 @@ RUNTIME = RuntimeConfig()
 # .\venv\Scripts\Activate.ps1   
 # py -m venv venv  
 # pip install -r requirements.txt     
-# python.exe -m pip install --upgrade pip    
+# python.exe -m pip install --upgrade pip
