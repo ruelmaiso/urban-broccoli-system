@@ -216,6 +216,9 @@ class TeacherDeployServer:
         self.extension_status_by_pc: dict[str, str] = {}
         self.session_extension_ms_by_timer_pc: dict[tuple[str, str], int] = {}
         self.video_status_last_ts_by_pc: dict[str, float] = {}
+        # Only timers paused by this screen-share session are resumed on stop.
+        # This preserves an independently paused session's state.
+        self.screen_share_paused_session_pc_ids: set[str] = set()
         self.udp_send_sock: Optional[socket.socket] = None
         self.udp_send_lock = threading.Lock()
         self.screen_share = ScreenShareBroadcaster(
@@ -1730,11 +1733,26 @@ class TeacherDeployServer:
 
     def start_screen_share(self) -> tuple[str, int]:
         self._log_event("SCREEN_SHARE_START_REQUESTED")
-        session_id = self.screen_share.start_session()
         with self.lock:
             targets = [pc_id for pc_id, client in self.clients.items() if client.online and client.control_sock]
+        if not targets:
+            self._log_event("SCREEN_SHARE_START_REJECTED", reason="no_eligible_students")
+            return "", 0
+        session_id = self.screen_share.start_session()
+        pause_ts = time.time()
+        with self.lock:
+            self.screen_share_paused_session_pc_ids.clear()
+            for pc_id in targets:
+                client = self.clients.get(pc_id)
+                if client and client.current_user and client.session_timer and not client.session_timer.paused:
+                    client.session_timer.paused = True
+                    client.session_timer.paused_at_ts = pause_ts
+                    self.screen_share_paused_session_pc_ids.add(pc_id)
+                    if pc_id in self.active_sessions_by_pc_id:
+                        self.active_sessions_by_pc_id[pc_id]["session_timer"] = self._session_timer_payload(client.session_timer)
         for pc_id in targets:
             self._send_screen_share_start(pc_id, session_id)
+        self._persist_session_timers()
         return session_id, len(targets)
 
     def stop_screen_share(self) -> None:
@@ -1745,6 +1763,21 @@ class TeacherDeployServer:
             targets = [pc_id for pc_id, client in self.clients.items() if client.online and client.control_sock]
         for pc_id in targets:
             self.send_command(pc_id, "SCREEN_SHARE_STOP", {"session_id": session_id})
+        resume_ts = time.time()
+        with self.lock:
+            paused_by_share = set(self.screen_share_paused_session_pc_ids)
+            self.screen_share_paused_session_pc_ids.clear()
+            for pc_id in paused_by_share:
+                client = self.clients.get(pc_id)
+                if not client or not client.session_timer or not client.session_timer.paused:
+                    continue
+                if client.session_timer.paused_at_ts is not None:
+                    client.session_timer.paused_accum_ms += max(0, int((resume_ts - client.session_timer.paused_at_ts) * 1000))
+                client.session_timer.paused = False
+                client.session_timer.paused_at_ts = None
+                if pc_id in self.active_sessions_by_pc_id:
+                    self.active_sessions_by_pc_id[pc_id]["session_timer"] = self._session_timer_payload(client.session_timer)
+        self._persist_session_timers()
 
     def shutdown_targets(self, targets: list[str]) -> list[str]:
         with self.lock:
@@ -2058,6 +2091,9 @@ class TeacherDeployUI:
             **BUTTON_NEUTRAL,
         )
         self.chat_btn.pack(side="right", padx=(8, 0), after=self.reservations_button)
+        self.chat_unread_badge = ctk.CTkLabel(
+            title_row, text="●", font=("Arial", 15, "bold"), text_color="#DC2626", fg_color="transparent"
+        )
         self.students_button = ctk.CTkButton(
             title_row,
             text="Students",
@@ -2350,17 +2386,32 @@ class TeacherDeployUI:
             self._set_runtime_notice("Screen sharing stopped.", ESSU_WARNING, hold_s=8.0)
         else:
             _session_id, target_count = self.server.start_screen_share()
+            if not _session_id:
+                self._set_runtime_notice("Screen sharing requires an online student.", ESSU_WARNING, hold_s=8.0)
+                self._refresh_screen_share_button()
+                return
             self._set_runtime_notice(f"Screen sharing started for {target_count} online student(s).", ESSU_PRIMARY, hold_s=8.0)
         self._refresh_screen_share_button()
 
     def _refresh_screen_share_button(self) -> None:
         active = bool(self.server.screen_share.active_session_id)
         viewers = self.server.screen_share.viewer_count()
+        with self.server.lock:
+            eligible = any(client.online and client.control_sock is not None for client in self.server.clients.values())
         self._configure_if_changed(
             self.screen_share_button,
             text=(f"Stop Sharing ({viewers})" if active else "Share Screen"),
             fg_color=(ESSU_ERROR if active else BUTTON_PRIMARY.get("fg_color")),
+            state="normal" if active or eligible else "disabled",
         )
+
+    def _refresh_chat_notification(self) -> None:
+        with self.server.lock:
+            unread = sum(int(conversation.get("unread", 0)) for conversation in self.server.conversations.values())
+        if unread:
+            self.chat_unread_badge.place(in_=self.chat_btn, relx=0.82, rely=0.16, anchor="center")
+        else:
+            self.chat_unread_badge.place_forget()
 
     def _on_close_requested(self) -> None:
         if messagebox.askyesno(
@@ -2531,6 +2582,7 @@ class TeacherDeployUI:
                 self.chat_btn.pack(side="right", padx=(8, 0), after=self.reservations_button)
             self._configure_if_changed(self.chat_btn, state="normal")
         else:
+            self.chat_unread_badge.place_forget()
             if self.chat_btn.winfo_manager():
                 self.chat_btn.pack_forget()
             if self.chat_sidebar_window is not None and self.chat_sidebar_window.winfo_exists():
@@ -4064,6 +4116,7 @@ class TeacherDeployUI:
 
             self._refresh_control_buttons()
             self._refresh_screen_share_button()
+            self._refresh_chat_notification()
         except Exception as exc:
             self.server._log_event("ui_drain_error", reason=str(exc))
             self._set_runtime_notice("Dashboard recovered after a refresh issue.", ESSU_WARNING, hold_s=20.0)

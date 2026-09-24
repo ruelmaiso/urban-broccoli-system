@@ -226,27 +226,81 @@ class ScreenShareBroadcaster:
             self._log("screen_share_capture_stopped", session_id=session_id)
 
     def _audio_producer(self, session_id: str) -> None:
-        """Capture default Windows playback through WASAPI loopback, never microphone input."""
-        stream = None
-        audio = None
+        """Capture only the Admin's default physical microphone input.
+
+        The established Student audio protocol is retained: signed 16-bit PCM at
+        the configured rate/channel count and fixed frame size.  In particular,
+        this deliberately does not use WASAPI loopback or any desktop-output
+        capture path.
+        """
+        stream = audio = None
         self._log("screen_share_audio_capture_started", session_id=session_id)
+
+        def normalize_pcm(chunk: bytes, source_rate: int, source_channels: int) -> bytes:
+            """Convert a captured source to the fixed, existing network format."""
+            samples = numpy.frombuffer(chunk, dtype=numpy.int16)
+            if samples.size % source_channels:
+                samples = samples[:samples.size - (samples.size % source_channels)]
+            expected_samples = self.audio_chunk_frames * self.audio_channels
+            if not samples.size:
+                return b"\0" * (expected_samples * 2)
+            samples = samples.reshape(-1, source_channels)
+            if source_channels == 1 and self.audio_channels == 2:
+                samples = numpy.repeat(samples, 2, axis=1)
+            elif source_channels == 2 and self.audio_channels == 1:
+                samples = samples.astype(numpy.int32).mean(axis=1, keepdims=True).astype(numpy.int16)
+            if source_rate != self.audio_rate:
+                target_frames = max(1, round(samples.shape[0] * self.audio_rate / source_rate))
+                source_axis = numpy.arange(samples.shape[0])
+                target_axis = numpy.linspace(0, samples.shape[0] - 1, target_frames)
+                samples = numpy.stack([numpy.interp(target_axis, source_axis, samples[:, channel]) for channel in range(self.audio_channels)], axis=1).astype(numpy.int16)
+            flattened = samples.reshape(-1)[:expected_samples]
+            if flattened.size < expected_samples:
+                flattened = numpy.pad(flattened, (0, expected_samples - flattened.size))
+            return flattened.astype(numpy.int16, copy=False).tobytes()
+
         try:
             import pyaudiowpatch as pyaudio
             audio = pyaudio.PyAudio()
-            loopback = audio.get_default_wasapi_loopback()
-            if not loopback:
-                raise RuntimeError("default WASAPI loopback device unavailable")
-            channels = self.audio_channels
-            if int(loopback["maxInputChannels"]) < channels:
-                raise RuntimeError("default WASAPI loopback device does not support configured channel count")
-            stream = audio.open(format=pyaudio.paInt16, channels=channels, rate=self.audio_rate,
-                                input=True, input_device_index=loopback["index"],
-                                frames_per_buffer=self.audio_chunk_frames)
+            # PyAudioWPatch exposes the operating system's default *input*
+            # endpoint through this API.  It is the safest available choice for
+            # the Admin's selected built-in/USB microphone without inventing a
+            # device-selection mechanism.
+            microphone = audio.get_default_input_device_info()
+            if not microphone:
+                raise RuntimeError("default microphone input device unavailable")
+            if bool(microphone.get("isLoopbackDevice", False)):
+                raise RuntimeError("default input device is a loopback endpoint, not a microphone")
+            source_channels = min(self.audio_channels, int(microphone.get("maxInputChannels", 0)))
+            if source_channels <= 0:
+                raise RuntimeError("default microphone has no input channels")
+            source_rate = max(8000, int(float(microphone.get("defaultSampleRate", self.audio_rate))))
+            source_frames = max(1, round(self.audio_chunk_frames * source_rate / self.audio_rate))
+            stream = audio.open(
+                format=pyaudio.paInt16,
+                channels=source_channels,
+                rate=source_rate,
+                input=True,
+                input_device_index=microphone["index"],
+                frames_per_buffer=source_frames,
+            )
+            self._log(
+                "screen_share_microphone_started",
+                session_id=session_id,
+                device_index=microphone["index"],
+                device_name=str(microphone.get("name", "")),
+                rate=source_rate,
+                channels=source_channels,
+                chunk_frames=source_frames,
+            )
             while self._session_current(session_id):
-                chunk = stream.read(self.audio_chunk_frames, exception_on_overflow=False)
-                self._distribute("audio", chunk)
+                raw = stream.read(source_frames, exception_on_overflow=False)
+                self._distribute("audio", normalize_pcm(raw, source_rate, source_channels))
         except Exception as exc:
-            self._log("screen_share_audio_capture_failed", session_id=session_id, reason=str(exc))
+            # This worker is isolated from capture, control, and per-viewer
+            # sender threads.  Failure leaves screen sharing active without
+            # fabricated/silent audio and records the real device error.
+            self._log("screen_share_microphone_failed", session_id=session_id, reason=str(exc))
         finally:
             if stream:
                 try: stream.stop_stream(); stream.close()
